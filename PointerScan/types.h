@@ -28,7 +28,7 @@ struct MemoryRegion {
         if (n) {
             int len = strlen(n);
             strncpy(name, n, len);
-            //name[len+1] = '\0';
+            name[len+1] = '\0';
         } else {
             name[0] = '\0';
         }
