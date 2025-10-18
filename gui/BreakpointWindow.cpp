@@ -1,0 +1,1785 @@
+#include "BreakpointWindow.h"
+#include "MemoryViewerWindow.h"
+#include "DisassemblyHelper.h"
+#include "Gui.h"
+#include "../imgui/imgui.h"
+#include "../socket/client_singleton.h"
+#include "../socket/client.hpp"
+#include <algorithm>
+#include <cstring>
+
+BreakpointWindow::BreakpointWindow()
+{
+    name = "断点调试器";
+    
+    // 初始化反汇编助手
+    if (DisassemblyHelper::isCapstoneAvailable()) {
+        disassemblyHelper = new DisassemblyHelper();
+        // 初始化为 ARM64 架构（根据需要可以改为其他架构）
+        if (disassemblyHelper->initialize(DisassemblyHelper::Architecture::ARM64)) {
+            disassemblyInitialized = true;
+            Gui::log("反汇编引擎已初始化 (ARM64)");
+        } else {
+            Gui::log("警告: 反汇编引擎初始化失败");
+            delete disassemblyHelper;
+            disassemblyHelper = nullptr;
+        }
+    } else {
+        Gui::log("警告: Capstone 库不可用，反汇编功能已禁用");
+    }
+}
+
+void BreakpointWindow::setProcessInfo(int* pid, std::string* processName)
+{
+    selectedPid = pid;
+    selectedName = processName;
+}
+
+void BreakpointWindow::setMemoryViewerWindow(MemoryViewerWindow* memViewer)
+{
+    memoryViewerWindow = memViewer;
+}
+
+void BreakpointWindow::setOpenMemoryViewerCallback(std::function<MemoryViewerWindow*()> callback)
+{
+    openMemoryViewerCallback = callback;
+}
+
+void BreakpointWindow::onDraw()
+{
+    if (!pOpen) return;
+
+    if (ImGui::Begin(name.c_str(), &pOpen, ImGuiWindowFlags_None))
+    {
+        if (selectedPid && *selectedPid != 0) {
+            ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f), "已附加: %s (PID %d)", 
+                selectedName ? selectedName->c_str() : "Unknown", *selectedPid);
+        } else {
+            ImGui::TextDisabled("未附加进程");
+        }
+        ImGui::Separator();
+
+        // 控制按钮
+        drawBreakpointControls();
+        
+        ImGui::Separator();
+        
+        // 只显示断点列表，详情改为弹窗
+        drawBreakpointList();
+        
+        // 添加断点对话框
+        if (showAddBreakpointDialog) {
+            drawAddBreakpointDialog();
+        }
+    }
+    ImGui::End();
+    
+    // 绘制所有详情弹窗
+    for (size_t i = 0; i < detailWindows.size(); i++) {
+        if (detailWindows[i].isOpen) {
+            drawBreakpointDetailWindow(detailWindows[i]);
+        }
+    }
+    
+    // 调试信息：显示当前打开的详情窗口数量
+    static float lastLogTime = 0;
+    float currentTime = ImGui::GetTime();
+    if (currentTime - lastLogTime > 5.0f && !detailWindows.empty()) {  // 每5秒记录一次
+        int openWindows = 0;
+        for (const auto& window : detailWindows) {
+            if (window.isOpen) openWindows++;
+        }
+        if (openWindows > 0) {
+            Gui::log("调试: 当前有 %d 个详情窗口打开", openWindows);
+        }
+        lastLogTime = currentTime;
+    }
+    
+    // 清理已关闭的弹窗
+    detailWindows.erase(
+        std::remove_if(detailWindows.begin(), detailWindows.end(),
+            [](const BreakpointDetailWindow& window) { return !window.isOpen; }),
+        detailWindows.end()
+    );
+}
+
+void BreakpointWindow::drawBreakpointControls()
+{
+    if (ImGui::Button("添加断点")) {
+        showAddBreakpointDialog = true;
+    }
+    
+    ImGui::SameLine();
+    if (ImGui::Button("清除所有断点")) {
+        for (int i = breakpoints.size() - 1; i >= 0; i--) {
+            removeBreakpoint(i);
+        }
+        refreshAllDetailWindows();
+    }
+    
+    ImGui::SameLine();
+    if (ImGui::Button("刷新所有断点")) {
+        for (int i = 0; i < (int)breakpoints.size(); i++) {
+            if (breakpoints[i].enabled) {
+                refreshBreakpointHitInfo(i);
+            }
+        }
+    }
+    
+    ImGui::SameLine();
+    ImGui::Checkbox("自动刷新", &autoRefreshHitInfo);
+    
+    if (autoRefreshHitInfo) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100);
+        ImGui::SliderFloat("刷新间隔", &refreshInterval, 0.5f, 5.0f, "%.1fs");
+    }
+}
+
+void BreakpointWindow::drawBreakpointList()
+{
+    ImGui::Text("断点列表 (%d个)", (int)breakpoints.size());
+    
+    if (ImGui::BeginTable("BreakpointTable", 9, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY))
+    {
+        ImGui::TableSetupColumn("启用", ImGuiTableColumnFlags_WidthFixed, 50);
+        ImGui::TableSetupColumn("地址", ImGuiTableColumnFlags_WidthFixed, 120);
+        ImGui::TableSetupColumn("类型", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 50);
+        ImGui::TableSetupColumn("状态", ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn("命中", ImGuiTableColumnFlags_WidthFixed, 50);
+        ImGui::TableSetupColumn("PC数", ImGuiTableColumnFlags_WidthFixed, 50);
+        ImGui::TableSetupColumn("描述", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("操作", ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableHeadersRow();
+        
+        for (size_t i = 0; i < breakpoints.size(); i++)
+        {
+            auto& bp = breakpoints[i];
+            ImGui::TableNextRow();
+            
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushID((int)i);
+            
+            bool enabled = bp.enabled;
+            if (ImGui::Checkbox("##enabled", &enabled)) {
+                toggleBreakpoint((int)i);
+            }
+            
+            ImGui::TableSetColumnIndex(1);
+            char addrStr[32];
+            sprintf(addrStr, "0x%llX", bp.address);
+            if (ImGui::Selectable(addrStr, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                // 双击打开详情窗口
+                if (ImGui::IsMouseDoubleClicked(0)) {
+                    openBreakpointDetailWindow((int)i);
+                }
+            }
+            
+            // 右键菜单 - 使用唯一ID避免断言失败
+            char bp_popup_id[64];
+            snprintf(bp_popup_id, sizeof(bp_popup_id), "BPPopup_%zu", i);
+            if (ImGui::BeginPopupContextItem(bp_popup_id)) {
+                if (ImGui::MenuItem("删除断点")) {
+                    removeBreakpoint((int)i);
+                    ImGui::EndPopup();
+                    ImGui::PopID();
+                    break;
+                }
+                if (bp.enabled) {
+                    if (bp.suspended) {
+                        if (ImGui::MenuItem("恢复断点")) {
+                            resumeBreakpoint((int)i);
+                        }
+                    } else {
+                        if (ImGui::MenuItem("暂停断点")) {
+                            suspendBreakpoint((int)i);
+                        }
+                    }
+                }
+                if (ImGui::MenuItem("刷新命中信息")) {
+                    refreshBreakpointHitInfo((int)i);
+                }
+                if (ImGui::MenuItem("查看详细信息")) {
+                    Gui::log("用户点击查看详细信息，断点索引: %d", (int)i);
+                    openBreakpointDetailWindow((int)i);
+                }
+                ImGui::EndPopup();
+            }
+            
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%s", getBreakpointTypeName(bp.type));
+            
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%s", getBreakpointSizeName(bp.size));
+            
+            ImGui::TableSetColumnIndex(4);
+            if (!bp.enabled) {
+                ImGui::TextDisabled("禁用");
+            } else if (bp.suspended) {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "暂停");
+            } else {
+                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "活动");
+            }
+            
+            ImGui::TableSetColumnIndex(5);
+            ImGui::Text("%d", bp.hitCount);
+            
+            ImGui::TableSetColumnIndex(6);
+            int pcCount = (int)bp.pcHitStats.size();
+            if (pcCount > 0) {
+                ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "%d", pcCount);
+                if (ImGui::IsItemHovered()) {
+                    // 显示热点PC信息
+                    if (!bp.pcHitStats.empty()) {
+                        auto maxHit = std::max_element(bp.pcHitStats.begin(), bp.pcHitStats.end(),
+                            [](const auto& a, const auto& b) { return a.second.hit_count < b.second.hit_count; });
+                        float maxHitRate = bp.hitCount > 0 ? (float)maxHit->second.hit_count / bp.hitCount * 100.0f : 0.0f;
+                        ImGui::SetTooltip("不同PC地址: %d个\n热点PC: 0x%llX\n热点命中: %d次 (%.1f%%)", 
+                                         pcCount, maxHit->first, maxHit->second.hit_count, maxHitRate);
+                    }
+                }
+            } else {
+                ImGui::TextDisabled("0");
+            }
+            
+            ImGui::TableSetColumnIndex(7);
+            ImGui::Text("%s", bp.description.c_str());
+            
+            ImGui::TableSetColumnIndex(8);
+            char buttonId[32];
+            sprintf(buttonId, "详情##%d", (int)i);
+            if (ImGui::SmallButton(buttonId)) {
+                Gui::log("用户点击详情按钮，断点索引: %d", (int)i);
+                openBreakpointDetailWindow((int)i);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("打开断点详情窗口");
+            }
+            
+            ImGui::PopID();
+        }
+        
+        ImGui::EndTable();
+    }
+}
+
+
+
+void BreakpointWindow::drawAddBreakpointDialog()
+{
+    if (ImGui::Begin("添加断点", &showAddBreakpointDialog, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::Text("断点地址:");
+        ImGui::InputText("##address", newBreakpointAddress, sizeof(newBreakpointAddress), ImGuiInputTextFlags_CharsHexadecimal);
+        
+        ImGui::Text("断点类型:");
+        const char* breakpointTypes[] = { "只读", "写入", "读写", "执行" }; 
+        ImGui::Combo("##type", &newBreakpointType, breakpointTypes, 4);
+        
+        ImGui::Text("断点大小:");
+        const char* breakpointSizes[] = { "1字节", "2字节", "4字节", "8字节" };
+        ImGui::Combo("##size", &newBreakpointSize, breakpointSizes, 4);
+        
+        ImGui::Text("描述:");
+        ImGui::InputText("##description", newBreakpointDescription, sizeof(newBreakpointDescription));
+        
+        ImGui::Separator();
+        
+        if (ImGui::Button("添加")) {
+            uint64_t address = 0;
+            if (sscanf(newBreakpointAddress, "%llx", &address) == 1) {
+                BreakpointType type = (BreakpointType)(newBreakpointType+1);
+                BreakpointSize size = (BreakpointSize)(1 << newBreakpointSize);
+                
+                addBreakpoint(address, type, size, newBreakpointDescription);
+                
+                // 清空输入
+                memset(newBreakpointAddress, 0, sizeof(newBreakpointAddress));
+                memset(newBreakpointDescription, 0, sizeof(newBreakpointDescription));
+                newBreakpointType = 0;
+                newBreakpointSize = 0;
+                
+                showAddBreakpointDialog = false;
+            } else {
+                Gui::log("无效的地址格式");
+            }
+        }
+        
+        ImGui::SameLine();
+        if (ImGui::Button("取消")) {
+            showAddBreakpointDialog = false;
+        }
+    }
+    ImGui::End();
+}
+
+const char* BreakpointWindow::getBreakpointTypeName(BreakpointType type)
+{
+    switch (type) {
+        case BreakpointType::HW_BREAKPOINT_R: return "只读";
+        case BreakpointType::HW_BREAKPOINT_W: return "写入";
+        case BreakpointType::HW_BREAKPOINT_RW: return "读写";
+        case BreakpointType::HW_BREAKPOINT_X: return "执行";
+        default: return "未知";
+    }
+}
+
+const char* BreakpointWindow::getBreakpointSizeName(BreakpointSize size)
+{
+    switch (size) {
+        case BreakpointSize::SIZE_1: return "1B";
+        case BreakpointSize::SIZE_2: return "2B";
+        case BreakpointSize::SIZE_4: return "4B";
+        case BreakpointSize::SIZE_8: return "8B";
+        default: return "?";
+    }
+}
+
+void BreakpointWindow::addBreakpoint(uint64_t address, BreakpointType type, BreakpointSize size, const std::string& description)
+{
+    if (!selectedPid || *selectedPid == 0) {
+        Gui::log("未附加进程，无法设置断点");
+        return;
+    }
+    
+    if (SetKernelBreakpoint(address, (uint32_t)type, (uint32_t)size)) {
+        BreakpointInfo bp;
+        bp.address = address;
+        bp.type = type;
+        bp.size = size;
+        bp.description = description;
+        bp.enabled = true;
+        bp.suspended = false;
+        bp.hitCount = 0;
+        
+        breakpoints.push_back(bp);
+        Gui::log("断点已设置: 0x%llX", address);
+    } else {
+        Gui::log("设置断点失败: 0x%llX", address);
+    }
+}
+
+void BreakpointWindow::removeBreakpoint(int index)
+{
+    if (index < 0 || index >= (int)breakpoints.size()) return;
+    
+    auto& bp = breakpoints[index];
+    if (bp.enabled) {
+        if (RemoveKernelBreakpoint(bp.address)) {
+            Gui::log("断点已移除: 0x%llX", bp.address);
+        } else {
+            Gui::log("移除断点失败: 0x%llX", bp.address);
+        }
+    }
+    
+    breakpoints.erase(breakpoints.begin() + index);
+    
+    // 更新所有打开的详情窗口的断点索引
+    for (auto& window : detailWindows) {
+        if (window.breakpointIndex > index) {
+            window.breakpointIndex--;
+        } else if (window.breakpointIndex == index) {
+            window.isOpen = false; // 关闭被删除断点的详情窗口
+        }
+    }
+}
+
+void BreakpointWindow::toggleBreakpoint(int index)
+{
+    if (index < 0 || index >= (int)breakpoints.size()) return;
+    
+    auto& bp = breakpoints[index];
+    if (bp.enabled) {
+        // 禁用断点
+        if (RemoveKernelBreakpoint(bp.address)) {
+            bp.enabled = false;
+            bp.suspended = false;
+            Gui::log("断点已禁用: 0x%llX", bp.address);
+        } else {
+            Gui::log("禁用断点失败: 0x%llX", bp.address);
+        }
+    } else {
+        // 启用断点
+        if (SetKernelBreakpoint(bp.address, (uint32_t)bp.type, (uint32_t)bp.size)) {
+            bp.enabled = true;
+            bp.suspended = false;
+            Gui::log("断点已启用: 0x%llX", bp.address);
+        } else {
+            Gui::log("启用断点失败: 0x%llX", bp.address);
+        }
+    }
+}
+
+void BreakpointWindow::suspendBreakpoint(int index)
+{
+    if (index < 0 || index >= (int)breakpoints.size()) return;
+    
+    auto& bp = breakpoints[index];
+    if (!bp.enabled || bp.suspended) return;
+    
+    if (SuspendKernelBreakpoint(bp.address)) {
+        bp.suspended = true;
+        Gui::log("断点已暂停: 0x%llX", bp.address);
+    } else {
+        Gui::log("暂停断点失败: 0x%llX", bp.address);
+    }
+}
+
+void BreakpointWindow::resumeBreakpoint(int index)
+{
+    if (index < 0 || index >= (int)breakpoints.size()) return;
+    
+    auto& bp = breakpoints[index];
+    if (!bp.enabled || !bp.suspended) return;
+    
+    if (ResumeKernelBreakpoint(bp.address)) {
+        bp.suspended = false;
+        Gui::log("断点已恢复: 0x%llX", bp.address);
+    } else {
+        Gui::log("恢复断点失败: 0x%llX", bp.address);
+    }
+}
+
+void BreakpointWindow::refreshBreakpointHitInfo(int index)
+{
+    if (index < 0 || index >= (int)breakpoints.size()) {
+        Gui::log("错误: refreshBreakpointHitInfo 无效索引 %d", index);
+        return;
+    }
+    
+    auto& bp = breakpoints[index];
+    if (!bp.enabled) {
+        Gui::log("断点 0x%llX 未启用，跳过刷新", bp.address);
+        return;
+    }
+    
+    std::vector<HW_HIT_INFO> hitInfos;
+    if (ReadKernelBreakpointInfo(bp.address, hitInfos)) {
+        int newCount = (int)hitInfos.size();
+        
+        // 如果没有新数据，直接返回
+        if (newCount == 0) {
+            return;
+        }
+        
+        Gui::log("断点 0x%llX 获取到 %d 条新命中记录", bp.address, newCount);
+        
+        // 直接追加所有新记录（假设每次读取都是新数据）
+        bp.hitHistory.insert(bp.hitHistory.end(), hitInfos.begin(), hitInfos.end());
+        
+        // 限制历史记录最大数量，防止内存溢出
+        const int MAX_HISTORY_SIZE = 50000; // 最多保留5万条记录
+        if ((int)bp.hitHistory.size() > MAX_HISTORY_SIZE) {
+            // 删除最旧的记录，保留最新的
+            int removeCount = (int)bp.hitHistory.size() - MAX_HISTORY_SIZE;
+            bp.hitHistory.erase(bp.hitHistory.begin(), bp.hitHistory.begin() + removeCount);
+            Gui::log("断点 0x%llX 历史记录已达上限，移除了 %d 条最旧记录", bp.address, removeCount);
+        }
+        
+        // 增量更新PC统计信息（只处理新增的记录）
+        for (const auto& hit : hitInfos) {
+            uint64_t pc = hit.regs_info.pc;
+            auto& stat = bp.pcHitStats[pc];
+            
+            if (stat.hit_count == 0) {
+                stat.pc_address = pc;
+                stat.first_hit_time = hit.hit_time;
+            }
+            
+            stat.hit_count++;
+            stat.last_hit_time = hit.hit_time;
+        }
+        
+        // 更新总命中次数和版本号
+        bp.hitCount = (int)bp.hitHistory.size();
+        bp.dataVersion++;
+        
+        // 通知所有相关的详情窗口需要刷新缓存
+        markDetailWindowsForRefresh(index);
+        
+        Gui::log("断点 0x%llX 命中信息已更新: +%d条新记录, 总计%d条 (版本: %d)", 
+                bp.address, newCount, bp.hitCount, bp.dataVersion);
+    } else {
+        Gui::log("获取断点命中信息失败: 0x%llX", bp.address);
+    }
+}
+
+void BreakpointWindow::updatePCHitStatistics(int index)
+{
+    if (index < 0 || index >= (int)breakpoints.size()) return;
+    
+    auto& bp = breakpoints[index];
+    bp.pcHitStats.clear();
+    
+    for (const auto& hit : bp.hitHistory) {
+        uint64_t pc = hit.regs_info.pc;
+        auto& stat = bp.pcHitStats[pc];
+        
+        if (stat.hit_count == 0) {
+            stat.pc_address = pc;
+            stat.first_hit_time = hit.hit_time;
+        }
+        
+        stat.hit_count++;
+        stat.last_hit_time = hit.hit_time;
+    }
+}
+
+void BreakpointWindow::markDetailWindowsForRefresh(int breakpointIndex)
+{
+    // 标记所有相关的详情窗口需要刷新缓存
+    for (auto& window : detailWindows) {
+        if (window.breakpointIndex == breakpointIndex && window.isOpen) {
+            window.needsStatRefresh = true;
+            window.needsHitRefresh = true;
+            // 清空缓存，强制重新构建
+            window.cachedSortedStats.clear();
+            window.lastFilterStr = "";
+            Gui::log("标记断点 %d 的详情窗口需要刷新", breakpointIndex);
+        }
+    }
+}
+
+void BreakpointWindow::refreshAllDetailWindows()
+{
+    // 刷新所有打开的详情窗口
+    for (auto& window : detailWindows) {
+        if (window.isOpen) {
+            window.needsStatRefresh = true;
+            window.needsHitRefresh = true;
+            window.cachedSortedStats.clear();
+            window.lastFilterStr = "";
+        }
+    }
+    if (!detailWindows.empty()) {
+        Gui::log("已标记所有详情窗口需要刷新");
+    }
+}
+
+ 
+
+void BreakpointWindow::openBreakpointDetailWindow(int breakpointIndex)
+{
+    if (breakpointIndex < 0 || breakpointIndex >= (int)breakpoints.size()) {
+        Gui::log("错误: 无效的断点索引 %d (范围: 0-%d)", breakpointIndex, (int)breakpoints.size() - 1);
+        return;
+    }
+    
+    // 检查是否已经有这个断点的详情窗口打开
+    for (auto& window : detailWindows) {
+        if (window.breakpointIndex == breakpointIndex && window.isOpen) {
+            // 如果已经打开，直接返回（或者可以选择聚焦到该窗口）
+            Gui::log("断点 %d 的详情窗口已经打开，不重复创建", breakpointIndex);
+            return;
+        }
+    }
+    
+    // 创建新的详情窗口
+    auto& bp = breakpoints[breakpointIndex];
+    char title[256];
+    sprintf(title, "断点详情 - 0x%llX##BP%d", bp.address, breakpointIndex);  // 添加##确保ID唯一
+    
+    Gui::log("创建详情窗口: 索引=%d, 地址=0x%llX, 标题=%s", breakpointIndex, bp.address, title);
+    
+    detailWindows.emplace_back(breakpointIndex, title);
+    
+    // 设置需要刷新的标志，而不是立即刷新
+    auto& newWindow = detailWindows.back();
+    newWindow.isOpen = true;  // 明确设置为打开状态
+    newWindow.needsStatRefresh = true;
+    newWindow.needsHitRefresh = true;
+    
+    Gui::log("详情窗口创建成功: 当前共有 %d 个窗口, isOpen=%d", (int)detailWindows.size(), newWindow.isOpen ? 1 : 0);
+}
+
+void BreakpointWindow::drawBreakpointDetailWindow(BreakpointDetailWindow& detailWindow)
+{
+    if (detailWindow.breakpointIndex < 0 || detailWindow.breakpointIndex >= (int)breakpoints.size()) {
+        Gui::log("警告: 详情窗口的断点索引无效 %d (断点数量: %d)，关闭窗口", 
+                detailWindow.breakpointIndex, (int)breakpoints.size());
+        detailWindow.isOpen = false;
+        return;
+    }
+    
+    auto& bp = breakpoints[detailWindow.breakpointIndex];
+    
+    // 设置窗口大小和位置（每个窗口稍微偏移，避免完全重叠）
+    static int windowOffset = 0;
+    ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(150 + windowOffset * 30, 120 + windowOffset * 30), ImGuiCond_FirstUseEver);
+    windowOffset = (windowOffset + 1) % 10;  // 最多偏移10次后循环
+    
+    // 确保窗口标题是唯一的
+    std::string windowTitle = detailWindow.windowTitle;
+    
+    // 尝试开始绘制窗口
+    bool windowVisible = ImGui::Begin(windowTitle.c_str(), &detailWindow.isOpen, ImGuiWindowFlags_None);
+    
+    if (!windowVisible) {
+        // 窗口被折叠或不可见，但仍然需要调用End
+        ImGui::End();
+        return;
+    }
+    
+    // 调试信息
+    ImGui::Text("窗口状态: 索引=%d, 地址=0x%llX, 命中=%d条", 
+               detailWindow.breakpointIndex, bp.address, bp.hitCount);
+    ImGui::Separator();
+    
+    // 断点基本信息 - 使用表格布局
+    if (ImGui::BeginTable("BasicInfo", 4, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("地址", ImGuiTableColumnFlags_WidthFixed, 150);
+        ImGui::TableSetupColumn("状态", ImGuiTableColumnFlags_WidthFixed, 100);
+        ImGui::TableSetupColumn("命中", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("描述", ImGuiTableColumnFlags_WidthStretch);
+        
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "0x%llX", bp.address);
+        ImGui::Text("(%s, %s)", getBreakpointTypeName(bp.type), getBreakpointSizeName(bp.size));
+        
+        ImGui::TableSetColumnIndex(1);
+        if (!bp.enabled) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "禁用");
+        } else if (bp.suspended) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "暂停");
+        } else {
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "活动");
+        }
+        
+        ImGui::TableSetColumnIndex(2);
+        ImGui::Text("%d", bp.hitCount);
+        if (bp.hitCount > 0 && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("总命中次数: %d", bp.hitCount);
+        }
+        
+        ImGui::TableSetColumnIndex(3);
+        ImGui::TextWrapped("%s", bp.description.empty() ? "无描述" : bp.description.c_str());
+        
+        ImGui::EndTable();
+    }
+    
+    ImGui::Separator();
+    
+    // 控制面板
+    if (ImGui::BeginTable("ControlPanel", 2, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("控制按钮", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("显示选项", ImGuiTableColumnFlags_WidthStretch);
+        
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        
+        if (ImGui::Button("刷新命中信息")) {
+            refreshBreakpointHitInfo(detailWindow.breakpointIndex);
+            detailWindow.needsStatRefresh = true;
+            detailWindow.needsHitRefresh = true;
+        }
+        ImGui::SameLine();
+                    if (ImGui::Button("清除命中历史")) {
+                bp.hitHistory.clear();
+                bp.pcHitStats.clear();
+                bp.hitCount = 0;
+                bp.dataVersion++;  // 增加数据版本号
+                // 通知所有相关的详情窗口需要刷新
+                markDetailWindowsForRefresh(detailWindow.breakpointIndex);
+                Gui::log("已清除断点 0x%llX 的命中历史 (版本: %d)", bp.address, bp.dataVersion);
+            }
+        
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Checkbox("PC统计", &detailWindow.showPCStatistics);
+        ImGui::SameLine();
+        ImGui::Checkbox("详细历史", &detailWindow.showHitHistoryDetails);
+        ImGui::Checkbox("寄存器信息", &detailWindow.showRegisterInfo);
+        ImGui::SameLine();
+        ImGui::Checkbox("紧凑模式", &detailWindow.compactMode);
+        
+        ImGui::EndTable();
+    }
+    
+    ImGui::Separator();
+    
+    // 使用标签页显示不同的信息
+    if (ImGui::BeginTabBar("BreakpointDetailsTab")) {
+        bool hasVisibleTab = false;
+        
+        if (detailWindow.showPCStatistics && ImGui::BeginTabItem("PC统计")) {
+            hasVisibleTab = true;
+            drawPCHitStatisticsInWindow(detailWindow);
+            ImGui::EndTabItem();
+        }
+        
+        if (detailWindow.showHitHistoryDetails && ImGui::BeginTabItem("命中历史")) {
+            hasVisibleTab = true;
+            drawDetailedHitInfoInWindow(detailWindow);
+            ImGui::EndTabItem();
+        }
+        
+        // 如果没有可见的标签页，显示一个默认的信息标签页
+        if (!hasVisibleTab) {
+            if (ImGui::BeginTabItem("信息")) {
+                ImGui::Text("请在上方选择要显示的信息类型：");
+                ImGui::Bullet(); ImGui::Text("PC统计 - 显示不同PC地址的命中统计");
+                ImGui::Bullet(); ImGui::Text("详细历史 - 显示完整的命中记录和寄存器信息");
+                
+                if (ImGui::Button("启用PC统计")) {
+                    detailWindow.showPCStatistics = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("启用详细历史")) {
+                    detailWindow.showHitHistoryDetails = true;
+                }
+                
+                ImGui::EndTabItem();
+            }
+        }
+        
+        ImGui::EndTabBar();
+    }
+    
+    // 自动刷新逻辑
+    if (autoRefreshHitInfo && bp.enabled && !bp.suspended) {
+        float currentTime = ImGui::GetTime();
+        if (currentTime - lastRefreshTime >= refreshInterval) {
+            refreshBreakpointHitInfo(detailWindow.breakpointIndex);
+            lastRefreshTime = currentTime;
+        }
+    }
+    ImGui::End();
+}
+
+void BreakpointWindow::drawPCHitStatisticsInWindow(BreakpointDetailWindow& detailWindow)
+{
+    if (detailWindow.breakpointIndex < 0 || detailWindow.breakpointIndex >= (int)breakpoints.size()) {
+        return;
+    }
+    
+    auto& bp = breakpoints[detailWindow.breakpointIndex];
+    
+    // 扩展的统计信息摘要
+    if (ImGui::BeginTable("StatsSummary", 5, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Borders))
+    {
+        ImGui::TableSetupColumn("不同PC", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("总命中", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("热点PC", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("平均命中", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("命中分布", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "%d个", (int)bp.pcHitStats.size());
+        
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextColored(ImVec4(0.9f, 0.6f, 1.0f, 1.0f), "%d次", bp.hitCount);
+        
+        ImGui::TableSetColumnIndex(2);
+        if (!bp.pcHitStats.empty()) {
+            auto maxHit = std::max_element(bp.pcHitStats.begin(), bp.pcHitStats.end(),
+                [](const auto& a, const auto& b) { return a.second.hit_count < b.second.hit_count; });
+            float maxHitRate = bp.hitCount > 0 ? (float)maxHit->second.hit_count / bp.hitCount * 100.0f : 0.0f;
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.6f, 1.0f), "0x%llX", maxHit->first);
+            ImGui::Text("(%d次, %.1f%%)", maxHit->second.hit_count, maxHitRate);
+        } else {
+            ImGui::TextDisabled("无");
+        }
+        
+        ImGui::TableSetColumnIndex(3);
+        if (!bp.pcHitStats.empty()) {
+            float avgHits = (float)bp.hitCount / bp.pcHitStats.size();
+            ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "%.1f次", avgHits);
+        } else {
+            ImGui::TextDisabled("0次");
+        }
+        
+        ImGui::TableSetColumnIndex(4);
+        if (!bp.pcHitStats.empty()) {
+            // 计算命中分布统计
+            int highFreq = 0, medFreq = 0, lowFreq = 0;
+            float avgHits = (float)bp.hitCount / bp.pcHitStats.size();
+            for (const auto& stat : bp.pcHitStats) {
+                if (stat.second.hit_count > avgHits * 2) {
+                    highFreq++;
+                } else if (stat.second.hit_count > avgHits * 0.5) {
+                    medFreq++;
+                } else {
+                    lowFreq++;
+                }
+            }
+            ImGui::Text("高频:%d 中频:%d 低频:%d", highFreq, medFreq, lowFreq);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("高频: >%.1f次\n中频: %.1f-%.1f次\n低频: <%.1f次", 
+                    avgHits * 2, avgHits * 0.5, avgHits * 2, avgHits * 0.5);
+            }
+        } else {
+            ImGui::TextDisabled("无数据");
+        }
+        
+        ImGui::EndTable();
+    }
+    
+    ImGui::Separator();
+    
+    // 搜索过滤器
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("过滤:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(200);
+    ImGui::InputText("##PCFilter", detailWindow.pcFilterBuffer, sizeof(detailWindow.pcFilterBuffer), ImGuiInputTextFlags_CharsHexadecimal);
+    ImGui::SameLine();
+    if (ImGui::Button("清除")) {
+        detailWindow.pcFilterBuffer[0] = '\0';
+        detailWindow.needsStatRefresh = true;
+    }
+    
+    // 检查是否需要刷新缓存
+    std::string currentFilter = detailWindow.pcFilterBuffer;
+    bool dataChanged = (detailWindow.cachedSortedStats.size() != bp.pcHitStats.size()) || 
+                      (detailWindow.lastDataVersion != bp.dataVersion);
+    bool sortChanged = (detailWindow.lastSortBy != detailWindow.sortBy) || 
+                      (detailWindow.lastSortDescending != detailWindow.sortDescending);
+    
+    // 数据量过大警告
+    if (bp.pcHitStats.size() > 10000) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), 
+                          "警告: PC统计数据较多 (%d个)，可能影响性能", (int)bp.pcHitStats.size());
+    }
+    
+    if (detailWindow.needsStatRefresh || currentFilter != detailWindow.lastFilterStr || dataChanged || sortChanged) {
+        detailWindow.cachedSortedStats.clear();
+        detailWindow.cachedSortedStats.reserve(bp.pcHitStats.size()); // 预分配内存
+        
+        try {
+            for (auto& pair : bp.pcHitStats) {
+                detailWindow.cachedSortedStats.push_back({pair.first, &pair.second});
+            }
+            
+            // 根据选择的排序方式进行排序
+            std::sort(detailWindow.cachedSortedStats.begin(), detailWindow.cachedSortedStats.end(), 
+            [&detailWindow, &bp](const auto& a, const auto& b) {
+                switch (detailWindow.sortBy) {
+                    case 0: // 命中次数
+                        if (detailWindow.sortDescending)
+                            return a.second->hit_count > b.second->hit_count;
+                        else
+                            return a.second->hit_count < b.second->hit_count;
+                    case 1: // PC地址
+                        if (detailWindow.sortDescending)
+                            return a.first > b.first;
+                        else
+                            return a.first < b.first;
+                    case 2: // 首次命中时间
+                        if (detailWindow.sortDescending)
+                            return a.second->first_hit_time > b.second->first_hit_time;
+                        else
+                            return a.second->first_hit_time < b.second->first_hit_time;
+                    case 3: // 最后命中时间
+                        if (detailWindow.sortDescending)
+                            return a.second->last_hit_time > b.second->last_hit_time;
+                        else
+                            return a.second->last_hit_time < b.second->last_hit_time;
+                    default:
+                        return false; // 默认情况，保持原顺序
+                }
+            });
+            
+            detailWindow.lastFilterStr = currentFilter;
+            detailWindow.needsStatRefresh = false;
+            detailWindow.lastDataVersion = bp.dataVersion;  // 更新版本号
+            detailWindow.lastSortBy = detailWindow.sortBy;
+            detailWindow.lastSortDescending = detailWindow.sortDescending;
+            
+            if (dataChanged) {
+                Gui::log("检测到PC统计数据变化，已刷新缓存 (版本: %d)", bp.dataVersion);
+            }
+        } catch (const std::exception& e) {
+            Gui::log("错误: 刷新PC统计缓存失败: %s", e.what());
+            detailWindow.cachedSortedStats.clear();
+        }
+    }
+    
+    // 排序选项
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("排序方式:");
+    ImGui::SameLine();
+    const char* sortOptions[] = { "命中次数", "PC地址", "首次命中时间", "最后命中时间" };
+    ImGui::SetNextItemWidth(120);
+    ImGui::Combo("##SortBy", &detailWindow.sortBy, sortOptions, 4);
+    ImGui::SameLine();
+    ImGui::Checkbox("降序", &detailWindow.sortDescending);
+    
+    ImGui::Separator();
+    
+    // 左右分栏布局
+    if (ImGui::BeginTable("PCStatLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV))
+    {
+        ImGui::TableSetupColumn("PC统计列表", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+        ImGui::TableSetupColumn("寄存器信息", ImGuiTableColumnFlags_WidthStretch, 0.4f);
+        ImGui::TableHeadersRow();
+        
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        
+        // 左侧：PC统计表格
+        if (ImGui::BeginChild("PCStatList", ImVec2(0, 0), true))
+        {
+            if (ImGui::BeginTable("PCStatTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY))
+            {
+                ImGui::TableSetupColumn("排名", ImGuiTableColumnFlags_WidthFixed, 50);
+                ImGui::TableSetupColumn("PC地址", ImGuiTableColumnFlags_WidthFixed, 120);
+                ImGui::TableSetupColumn("命中次数", ImGuiTableColumnFlags_WidthFixed, 80);
+                ImGui::TableSetupColumn("首次命中", ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableSetupColumn("最后命中", ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableSetupColumn("时间间隔", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableHeadersRow();
+                
+                // 应用过滤器
+                std::string filterStr = currentFilter;
+                std::transform(filterStr.begin(), filterStr.end(), filterStr.begin(), ::tolower);
+                
+                int rank = 0;
+                int displayCount = 0;
+                const int MAX_DISPLAY_ROWS = 5000; // 最多显示5000行，防止UI卡死
+                
+                for (const auto& pair : detailWindow.cachedSortedStats) {
+                    // 限制显示数量，防止界面卡顿
+                    if (displayCount >= MAX_DISPLAY_ROWS) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "...");
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "数据过多，仅显示前%d条", MAX_DISPLAY_ROWS);
+                        break;
+                    }
+                    
+                    const auto& stat = *pair.second;
+                    
+                    // 过滤逻辑
+                    if (!filterStr.empty()) {
+                        char addrStr[32];
+                        sprintf(addrStr, "%llx", stat.pc_address);
+                        std::string addrStrLower = addrStr;
+                        std::transform(addrStrLower.begin(), addrStrLower.end(), addrStrLower.begin(), ::tolower);
+                        
+                        if (addrStrLower.find(filterStr) == std::string::npos) {
+                            continue;  // 跳过不匹配的条目
+                        }
+                    }
+                    
+                    rank++;
+                    displayCount++;
+                    
+                    bool isSelected = (detailWindow.selectedPCAddress == stat.pc_address);
+                    ImGui::TableNextRow();
+                    
+                    ImGui::TableSetColumnIndex(0);
+                    // 显示排名，前三名使用特殊颜色
+                    if (rank == 1) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "#%d", rank);  // 金色
+                    } else if (rank == 2) {
+                        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "#%d", rank);  // 银色
+                    } else if (rank == 3) {
+                        ImGui::TextColored(ImVec4(0.8f, 0.5f, 0.2f, 1.0f), "#%d", rank);  // 铜色
+                    } else {
+                        ImGui::Text("#%d", rank);
+                    }
+                    
+                    ImGui::TableSetColumnIndex(1);
+                    char pcAddrStr[32];
+                    sprintf(pcAddrStr, "0x%llX", stat.pc_address);
+                    if (ImGui::Selectable(pcAddrStr, isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        detailWindow.selectedPCAddress = stat.pc_address;
+                        Gui::log("选中PC地址: 0x%llX", stat.pc_address);
+                    }
+                    
+                    // 右键菜单 - 使用唯一ID避免断言失败
+                    char pc_popup_id[64];
+                    snprintf(pc_popup_id, sizeof(pc_popup_id), "PCPopup_%llX", stat.pc_address);
+                    if (ImGui::BeginPopupContextItem(pc_popup_id)) {
+                        if (ImGui::MenuItem("复制地址")) {
+                            ImGui::SetClipboardText(pcAddrStr);
+                        }
+                        if (ImGui::MenuItem("在内存查看器中打开")) {
+                            MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                            if (viewer) {
+                                viewer->jumpToAddress(stat.pc_address);
+                                Gui::log("跳转到内存地址: 0x%llX", stat.pc_address);
+                            }
+                        }
+                        ImGui::EndPopup();
+                    }
+                    
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%d", stat.hit_count);
+                    
+                    ImGui::TableSetColumnIndex(3);
+                    std::string firstTime = formatTime(stat.first_hit_time);
+                    ImGui::Text("%s", firstTime.c_str());
+                    
+                    ImGui::TableSetColumnIndex(4);
+                    std::string lastTime = formatTime(stat.last_hit_time);
+                    ImGui::Text("%s", lastTime.c_str());
+                    
+                    ImGui::TableSetColumnIndex(5);
+                    std::string timeDiff = formatTimeDiff(stat.first_hit_time, stat.last_hit_time);
+                    ImGui::Text("%s", timeDiff.c_str());
+                    if (timeDiff != "-" && ImGui::IsItemHovered()) {
+                        uint64_t interval = stat.last_hit_time - stat.first_hit_time;
+                        ImGui::SetTooltip("精确时间间隔: %llu 个时间单位", interval);
+                    }
+                }
+                
+                ImGui::EndTable();
+            }
+        }
+        ImGui::EndChild();
+        
+        // 右侧：寄存器信息和反汇编
+        ImGui::TableSetColumnIndex(1);
+        if (ImGui::BeginChild("RegisterInfo", ImVec2(0, 0), true))
+        {
+            if (detailWindow.selectedPCAddress != 0) {
+                // 查找该PC地址的最新命中记录
+                bool foundHit = false;
+                for (int i = (int)bp.hitHistory.size() - 1; i >= 0; i--) {
+                    if (bp.hitHistory[i].regs_info.pc == detailWindow.selectedPCAddress) {
+                        ImGui::Text("PC地址: 0x%llX 的详细信息", detailWindow.selectedPCAddress);
+                        ImGui::Separator();
+                        
+                        // 使用标签页显示寄存器和反汇编
+                        if (ImGui::BeginTabBar("PCDetailTab")) {
+                            if (ImGui::BeginTabItem("寄存器")) {
+                                drawRegisterInfoInWindow(bp.hitHistory[i].regs_info, detailWindow);
+                                ImGui::EndTabItem();
+                            }
+                            
+                            if (detailWindow.showDisassembly && ImGui::BeginTabItem("反汇编")) {
+                                if (disassemblyInitialized && disassemblyHelper) {
+                                    ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "PC: 0x%llX 的反汇编", detailWindow.selectedPCAddress);
+                                    ImGui::Separator();
+                                    
+                                    // 控制选项
+                                    static int beforeCount = 4;
+                                    static int afterCount = 4;
+                                    ImGui::Text("显示范围:");
+                                    ImGui::SameLine();
+                                    ImGui::SetNextItemWidth(80);
+                                    ImGui::InputInt("##BeforeCount", &beforeCount, 1, 10);
+                                    ImGui::SameLine();
+                                    ImGui::Text("条指令前");
+                                    ImGui::SameLine();
+                                    ImGui::SetNextItemWidth(80);
+                                    ImGui::InputInt("##AfterCount", &afterCount, 1, 10);
+                                    ImGui::SameLine();
+                                    ImGui::Text("条指令后");
+                                    
+                                    // 限制范围
+                                    if (beforeCount < 0) beforeCount = 0;
+                                    if (beforeCount > 20) beforeCount = 20;
+                                    if (afterCount < 0) afterCount = 0;
+                                    if (afterCount > 20) afterCount = 20;
+                                    
+                                    ImGui::Separator();
+                                    
+                                    // 调用新的方法读取并显示PC周围的指令
+                                    drawDisassemblyForPC(detailWindow.selectedPCAddress, beforeCount, afterCount, detailWindow);
+                                } else {
+                                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "反汇编引擎未初始化");
+                                    ImGui::TextWrapped("请安装 Capstone 库以启用反汇编功能");
+                                }
+                                ImGui::EndTabItem();
+                            }
+                            
+                            ImGui::EndTabBar();
+                        }
+                        
+                        foundHit = true;
+                        break;
+                    }
+                }
+                
+                if (!foundHit) {
+                    ImGui::TextDisabled("未找到该PC地址的命中记录");
+                }
+            } else {
+                ImGui::TextDisabled("请在左侧列表中选择一个PC地址");
+                ImGui::TextWrapped("选中后将在此处显示该PC地址的寄存器状态和反汇编信息");
+            }
+        }
+        ImGui::EndChild();
+        
+        ImGui::EndTable();
+    }
+}
+
+void BreakpointWindow::drawDetailedHitInfoInWindow(BreakpointDetailWindow& detailWindow)
+{
+    if (detailWindow.breakpointIndex < 0 || detailWindow.breakpointIndex >= (int)breakpoints.size()) {
+        return;
+    }
+    
+    auto& bp = breakpoints[detailWindow.breakpointIndex];
+    
+    // 命中历史摘要
+    if (ImGui::BeginTable("HitSummary", 3, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("总记录", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("显示限制", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("最新命中", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Text("%d条", (int)bp.hitHistory.size());
+        
+        ImGui::TableSetColumnIndex(1);
+        ImGui::SetNextItemWidth(80);
+        ImGui::InputInt("##MaxHits", &detailWindow.maxDisplayedHits, 100, 500);
+        if (detailWindow.maxDisplayedHits < 10) detailWindow.maxDisplayedHits = 10;
+        if (detailWindow.maxDisplayedHits > 10000) detailWindow.maxDisplayedHits = 10000;
+        
+        ImGui::TableSetColumnIndex(2);
+        if (!bp.hitHistory.empty()) {
+            const auto& lastHit = bp.hitHistory.back();
+            ImGui::Text("时间: %llu", lastHit.hit_time);
+        } else {
+            ImGui::Text("无");
+        }
+        
+        ImGui::EndTable();
+    }
+    
+    ImGui::Separator();
+    
+    // 确定显示范围
+    int totalHits = (int)bp.hitHistory.size();
+    int displayCount = (totalHits < detailWindow.maxDisplayedHits) ? totalHits : detailWindow.maxDisplayedHits;
+    int startIndex = (totalHits - displayCount > 0) ? (totalHits - displayCount) : 0;
+    
+    if (totalHits > detailWindow.maxDisplayedHits) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), 
+                          "注意: 只显示最新的 %d 条记录 (共 %d 条)", displayCount, totalHits);
+    }
+    
+    // 命中记录列表
+    float childHeight = detailWindow.compactMode ? 150 : 200;
+    if (ImGui::BeginChild("HitList", ImVec2(0, childHeight), true)) {
+        if (ImGui::BeginTable("DetailedHitTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY))
+        {
+            ImGui::TableSetupColumn("序号", ImGuiTableColumnFlags_WidthFixed, 50);
+            ImGui::TableSetupColumn("命中地址", ImGuiTableColumnFlags_WidthFixed, 120);
+            ImGui::TableSetupColumn("PC地址", ImGuiTableColumnFlags_WidthFixed, 120);
+            ImGui::TableSetupColumn("命中时间", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            
+            for (int i = startIndex; i < startIndex + displayCount; i++)
+            {
+                const auto& hit = bp.hitHistory[i];
+                ImGui::TableNextRow();
+                
+                bool isSelected = (detailWindow.selectedHitIndex == i);
+                
+                ImGui::TableSetColumnIndex(0);
+                char indexStr[16];
+                sprintf(indexStr, "%d", i + 1);
+                if (ImGui::Selectable(indexStr, isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+                    detailWindow.selectedHitIndex = i;
+                }
+                
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("0x%llX", hit.hit_addr);
+                
+                ImGui::TableSetColumnIndex(2);
+                char pcStr[32];
+                sprintf(pcStr, "0x%llX", hit.regs_info.pc);
+                if (ImGui::Selectable(pcStr, false, ImGuiSelectableFlags_None)) {
+                    MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                    if (viewer) {
+                        viewer->jumpToAddress(hit.regs_info.pc);
+                        Gui::log("跳转到PC地址: 0x%llX", hit.regs_info.pc);
+                    }
+                }
+                
+                ImGui::TableSetColumnIndex(3);
+                std::string hitTime = formatTime(hit.hit_time);
+                ImGui::Text("%s", hitTime.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("精确时间戳: %llu", hit.hit_time);
+                }
+            }
+            
+            ImGui::EndTable();
+        }
+    }
+    ImGui::EndChild();
+    
+    // 显示选中记录的寄存器信息
+    if (detailWindow.showRegisterInfo && detailWindow.selectedHitIndex >= 0 && detailWindow.selectedHitIndex < (int)bp.hitHistory.size()) {
+        ImGui::Separator();
+        
+        // 寄存器信息标题
+        if (ImGui::BeginTable("RegInfoHeader", 2, ImGuiTableFlags_SizingStretchProp))
+        {
+            ImGui::TableSetupColumn("标题", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("操作", ImGuiTableColumnFlags_WidthFixed, 150);
+            
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("命中记录 #%d 的寄存器状态:", detailWindow.selectedHitIndex + 1);
+            
+            ImGui::TableSetColumnIndex(1);
+            if (ImGui::SmallButton("跳转到PC")) {
+                const auto& hit = bp.hitHistory[detailWindow.selectedHitIndex];
+                MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                if (viewer) {
+                    viewer->jumpToAddress(hit.regs_info.pc);
+                    Gui::log("跳转到PC地址: 0x%llX", hit.regs_info.pc);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("跳转到SP")) {
+                const auto& hit = bp.hitHistory[detailWindow.selectedHitIndex];
+                MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                if (viewer) {
+                    viewer->jumpToAddress(hit.regs_info.sp);
+                    Gui::log("跳转到栈地址: 0x%llX", hit.regs_info.sp);
+                }
+            }
+            
+            ImGui::EndTable();
+        }
+        
+        const auto& hit = bp.hitHistory[detailWindow.selectedHitIndex];
+        drawRegisterInfoInWindow(hit.regs_info, detailWindow);
+    }
+}
+
+void BreakpointWindow::drawRegisterInfoInWindow(const struct _user_pt_regs& regs, BreakpointDetailWindow& detailWindow)
+{
+    if (ImGui::BeginTable("RegisterTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+    {
+        ImGui::TableSetupColumn("寄存器", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("值 (十六进制)", ImGuiTableColumnFlags_WidthFixed, 140);
+        ImGui::TableSetupColumn("寄存器", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("值 (十六进制)", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        
+        // 显示通用寄存器 (X0-X30)
+        for (int i = 0; i < 31; i += 2) {
+            ImGui::TableNextRow();
+            
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "X%d", i);
+            ImGui::TableSetColumnIndex(1);
+            char regStr[32];
+            sprintf(regStr, "0x%016llX", regs.regs[i]);
+            if (ImGui::Selectable(regStr, false, ImGuiSelectableFlags_None)) {
+                if (regs.regs[i] != 0) {
+                    MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                    if (viewer) {
+                        viewer->jumpToAddress(regs.regs[i]);
+                        Gui::log("跳转到寄存器X%d地址: 0x%llX", i, regs.regs[i]);
+                    }
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("十进制: %llu\n点击跳转到内存查看器", regs.regs[i]);
+            }
+            
+            if (i + 1 < 31) {
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "X%d", i + 1);
+                ImGui::TableSetColumnIndex(3);
+                sprintf(regStr, "0x%016llX", regs.regs[i + 1]);
+                if (ImGui::Selectable(regStr, false, ImGuiSelectableFlags_None)) {
+                    if (regs.regs[i + 1] != 0) {
+                        MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                        if (viewer) {
+                            viewer->jumpToAddress(regs.regs[i + 1]);
+                            Gui::log("跳转到寄存器X%d地址: 0x%llX", i + 1, regs.regs[i + 1]);
+                        }
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("十进制: %llu\n点击跳转到内存查看器", regs.regs[i + 1]);
+                }
+            }
+        }
+        
+        // 显示特殊寄存器
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.7f, 1.0f), "SP");
+        ImGui::TableSetColumnIndex(1);
+        char spStr[32];
+        sprintf(spStr, "0x%016llX", regs.sp);
+        if (ImGui::Selectable(spStr, false, ImGuiSelectableFlags_None)) {
+            MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+            if (viewer) {
+                viewer->jumpToAddress(regs.sp);
+                Gui::log("跳转到栈指针地址: 0x%llX", regs.sp);
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("栈指针\n十进制: %llu\n点击跳转到内存查看器", regs.sp);
+        }
+        
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.7f, 1.0f), "PC");
+        ImGui::TableSetColumnIndex(3);
+        char pcStr[32];
+        sprintf(pcStr, "0x%016llX", regs.pc);
+        if (ImGui::Selectable(pcStr, false, ImGuiSelectableFlags_None)) {
+            MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+            if (viewer) {
+                viewer->jumpToAddress(regs.pc);
+                Gui::log("跳转到程序计数器地址: 0x%llX", regs.pc);
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("程序计数器\n十进制: %llu\n点击跳转到内存查看器", regs.pc);
+        }
+        
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.7f, 1.0f), "PSTATE");
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Text("0x%016llX", regs.pstate);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("处理器状态寄存器\n十进制: %llu", regs.pstate);
+        }
+        
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.7f, 1.0f), "ORIG_X0");
+        ImGui::TableSetColumnIndex(3);
+        ImGui::Text("0x%016llX", regs.orig_x0);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("原始X0寄存器值\n十进制: %llu", regs.orig_x0);
+        }
+        
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.7f, 1.0f), "SYSCALLNO");
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Text("0x%016llX", regs.syscallno);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("系统调用号\n十进制: %llu", regs.syscallno);
+        }
+        
+        ImGui::EndTable();
+    }
+}
+
+void BreakpointWindow::closeBreakpointDetailWindow(int windowIndex)
+{
+    if (windowIndex >= 0 && windowIndex < (int)detailWindows.size()) {
+        detailWindows[windowIndex].isOpen = false;
+    }
+} 
+
+std::string BreakpointWindow::formatTime(uint64_t timestamp)
+{
+    if (timestamp == 0) return "未知";
+    
+    // 简单的时间戳格式化
+    char buffer[32];
+    sprintf(buffer, "%llu", timestamp);
+    return std::string(buffer);
+}
+
+std::string BreakpointWindow::formatTimeDiff(uint64_t start, uint64_t end)
+{
+    if (start == 0 || end == 0 || end <= start) return "-";
+    
+    uint64_t diff = end - start;
+    char buffer[32];
+    
+    if (diff < 1000) {
+        sprintf(buffer, "%llu", diff);
+    } else if (diff < 1000000) {
+        sprintf(buffer, "%.1fK", diff / 1000.0);
+    } else if (diff < 1000000000) {
+        sprintf(buffer, "%.1fM", diff / 1000000.0);
+    } else {
+        sprintf(buffer, "%.1fG", diff / 1000000000.0);
+    }
+    
+    return std::string(buffer);
+}
+
+// 确保内存查看器窗口存在
+MemoryViewerWindow* BreakpointWindow::ensureMemoryViewerWindow()
+{
+    // 如果已经存在，直接返回
+    if (memoryViewerWindow) {
+        return memoryViewerWindow;
+    }
+    
+    // 如果有回调函数，使用回调创建窗口
+    if (openMemoryViewerCallback) {
+        memoryViewerWindow = openMemoryViewerCallback();
+        if (memoryViewerWindow) {
+            Gui::log("已自动打开内存查看器窗口");
+            return memoryViewerWindow;
+        }
+    }
+    
+    // 如果没有回调或回调失败，返回nullptr
+    Gui::log("错误: 无法打开内存查看器窗口");
+    return nullptr;
+}
+
+// 反汇编显示函数
+void BreakpointWindow::drawDisassemblyInWindow(uint64_t address, const uint8_t* code, size_t codeSize)
+{
+    if (!disassemblyInitialized || !disassemblyHelper) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "反汇编引擎未初始化");
+        ImGui::TextWrapped("提示: 请确保已安装 Capstone 库");
+        ImGui::Separator();
+        ImGui::Text("安装方法:");
+        ImGui::BulletText("使用 vcpkg: vcpkg install capstone:x64-windows");
+        ImGui::BulletText("或从 https://www.capstone-engine.org/ 下载预编译版本");
+        return;
+    }
+    
+    if (!code || codeSize == 0) {
+        ImGui::TextDisabled("无可用代码数据");
+        return;
+    }
+    
+    // 反汇编代码
+    DisassemblyResult result = disassemblyHelper->disassembleMultiple(address, code, codeSize, 20);
+    
+    if (!result.success) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "反汇编失败: %s", result.errorMessage.c_str());
+        return;
+    }
+    
+    // 显示反汇编结果
+    ImGui::Text("架构: %s", DisassemblyHelper::getArchitectureName(disassemblyHelper->getCurrentArchitecture()).c_str());
+    ImGui::Text("指令数量: %d", (int)result.instructions.size());
+    ImGui::Separator();
+    
+    // 使用表格显示反汇编指令
+    if (ImGui::BeginTable("DisassemblyTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY))
+    {
+        ImGui::TableSetupColumn("地址", ImGuiTableColumnFlags_WidthFixed, 120);
+        ImGui::TableSetupColumn("十六进制", ImGuiTableColumnFlags_WidthFixed, 120);
+        ImGui::TableSetupColumn("助记符", ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn("操作数", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        
+        for (const auto& instr : result.instructions) {
+            ImGui::TableNextRow();
+            
+            // 地址列
+            ImGui::TableSetColumnIndex(0);
+            char addrStr[32];
+            sprintf(addrStr, "0x%llX", instr.address);
+            if (ImGui::Selectable(addrStr, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                // 点击地址可以跳转到内存查看器
+                MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                if (viewer) {
+                    viewer->jumpToAddress(instr.address);
+                    Gui::log("跳转到地址: 0x%llX", instr.address);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("点击跳转到内存查看器\n地址: 0x%llX\n大小: %u 字节", 
+                                 instr.address, instr.size);
+            }
+            
+            // 右键菜单
+            char popup_id[64];
+            snprintf(popup_id, sizeof(popup_id), "DisasmPopup_%llX", instr.address);
+            if (ImGui::BeginPopupContextItem(popup_id)) {
+                if (ImGui::MenuItem("复制地址")) {
+                    ImGui::SetClipboardText(addrStr);
+                }
+                if (ImGui::MenuItem("复制指令")) {
+                    ImGui::SetClipboardText(instr.fullInstruction.c_str());
+                }
+                if (ImGui::MenuItem("在内存查看器中打开")) {
+                    MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                    if (viewer) {
+                        viewer->jumpToAddress(instr.address);
+                    }
+                }
+                ImGui::EndPopup();
+            }
+            
+            // 十六进制字节列
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", instr.hexBytes.c_str());
+            
+            // 助记符列
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.8f, 1.0f), "%s", instr.mnemonic.c_str());
+            
+            // 操作数列
+            ImGui::TableSetColumnIndex(3);
+            if (!instr.operands.empty()) {
+                ImGui::Text("%s", instr.operands.c_str());
+            } else {
+                ImGui::TextDisabled("-");
+            }
+        }
+        
+        ImGui::EndTable();
+    }
+}
+
+// 读取并反汇编PC地址周围的指令
+void BreakpointWindow::drawDisassemblyForPC(uint64_t pcAddress, int beforeCount, int afterCount, BreakpointDetailWindow& detailWindow)
+{
+    if (!disassemblyInitialized || !disassemblyHelper) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "反汇编引擎未初始化");
+        return;
+    }
+    
+    if (pcAddress == 0) {
+        ImGui::TextDisabled("PC地址无效");
+        return;
+    }
+    
+    // ARM64指令是4字节对齐的
+    const uint32_t INSTRUCTION_SIZE = 4;
+    
+    // 计算需要读取的内存范围
+    uint64_t startAddress = pcAddress - (beforeCount * INSTRUCTION_SIZE);
+    uint32_t totalInstructions = beforeCount + 1 + afterCount;
+    uint32_t totalSize = totalInstructions * INSTRUCTION_SIZE;
+    
+    // 检查缓存是否有效
+    bool cacheValid = detailWindow.disasmCache.isValid &&
+                     detailWindow.disasmCache.cachedPCAddress == pcAddress &&
+                     detailWindow.disasmCache.cachedBeforeCount == beforeCount &&
+                     detailWindow.disasmCache.cachedAfterCount == afterCount &&
+                     detailWindow.disasmCache.cachedResult != nullptr;
+    
+    // 自动刷新检查
+    float currentTime = ImGui::GetTime();
+    bool shouldAutoRefresh = detailWindow.autoRefreshDisasm && 
+                            (currentTime - detailWindow.lastDisasmRefreshTime >= detailWindow.disasmRefreshInterval);
+    
+    // 控制面板
+    ImGui::Text("反汇编控制:");
+    ImGui::SameLine();
+    if (ImGui::Button("手动刷新")) {
+        cacheValid = false;  // 强制刷新
+        detailWindow.lastDisasmRefreshTime = currentTime;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("自动刷新", &detailWindow.autoRefreshDisasm);
+    if (detailWindow.autoRefreshDisasm) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100);
+        ImGui::SliderFloat("间隔##disasm", &detailWindow.disasmRefreshInterval, 1.0f, 10.0f, "%.1fs");
+    }
+    
+    // 显示缓存状态
+    ImGui::SameLine();
+    if (cacheValid) {
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "[缓存]");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "[读取中]");
+    }
+    
+    ImGui::Separator();
+    
+    // 如果需要刷新或缓存无效，重新读取和反汇编
+    if (!cacheValid || shouldAutoRefresh) {
+        // 从远程进程读取内存
+        std::vector<unsigned char> memoryData;
+        bool readSuccess = ReadProcessMemoryBytes(startAddress, totalSize, memoryData);
+        
+        if (!readSuccess || memoryData.empty()) {
+            // 读取失败，但如果有缓存，继续使用缓存
+            if (cacheValid && detailWindow.disasmCache.cachedResult) {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "警告: 内存读取失败，使用缓存数据");
+                ImGui::Separator();
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "内存读取失败");
+                ImGui::TextWrapped("无法从地址 0x%llX 读取 %u 字节的内存。", startAddress, totalSize);
+                ImGui::Separator();
+                ImGui::Text("可能的原因:");
+                ImGui::BulletText("地址无效或不可访问");
+                ImGui::BulletText("进程未连接或句柄无效");
+                ImGui::BulletText("内存区域没有执行权限");
+                
+                // 清除缓存
+                detailWindow.disasmCache.isValid = false;
+                detailWindow.disasmCache.cachedResult.reset();
+                return;
+            }
+        } else {
+            // 读取成功，反汇编
+            auto result = std::make_shared<DisassemblyResult>();
+            *result = disassemblyHelper->disassembleMultiple(
+                startAddress, 
+                memoryData.data(), 
+                memoryData.size(), 
+                totalInstructions
+            );
+            
+            if (!result->success || result->instructions.empty()) {
+                // 反汇编失败，但如果有缓存，继续使用缓存
+                if (cacheValid && detailWindow.disasmCache.cachedResult) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "警告: 反汇编失败，使用缓存数据");
+                    ImGui::Separator();
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "反汇编失败: %s", 
+                                      result->success ? "没有指令" : result->errorMessage.c_str());
+                    detailWindow.disasmCache.isValid = false;
+                    detailWindow.disasmCache.cachedResult.reset();
+                    return;
+                }
+            } else {
+                // 成功，更新缓存
+                detailWindow.disasmCache.cachedPCAddress = pcAddress;
+                detailWindow.disasmCache.cachedBeforeCount = beforeCount;
+                detailWindow.disasmCache.cachedAfterCount = afterCount;
+                detailWindow.disasmCache.cachedMemoryData = std::move(memoryData);
+                detailWindow.disasmCache.cachedResult = result;
+                detailWindow.disasmCache.isValid = true;
+                detailWindow.lastDisasmRefreshTime = currentTime;
+                
+                ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "内存读取成功 (%zu 字节)", 
+                                  detailWindow.disasmCache.cachedMemoryData.size());
+                ImGui::Separator();
+            }
+        }
+    }
+    
+    // 使用缓存的结果显示
+    if (!detailWindow.disasmCache.isValid || !detailWindow.disasmCache.cachedResult) {
+        ImGui::TextDisabled("没有可用的反汇编数据");
+        return;
+    }
+    
+    auto& result = *detailWindow.disasmCache.cachedResult;
+    
+    // 显示反汇编结果
+    ImGui::Text("架构: %s", DisassemblyHelper::getArchitectureName(disassemblyHelper->getCurrentArchitecture()).c_str());
+    ImGui::Text("反汇编指令数: %d / %d", (int)result.instructions.size(), totalInstructions);
+    ImGui::Separator();
+    
+    // 使用表格显示反汇编指令
+    if (ImGui::BeginTable("DisassemblyPCTable", 5, 
+        ImGuiTableFlags_Borders | 
+        ImGuiTableFlags_RowBg | 
+        ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Resizable))
+    {
+        ImGui::TableSetupColumn("标记", ImGuiTableColumnFlags_WidthFixed, 40);
+        ImGui::TableSetupColumn("地址", ImGuiTableColumnFlags_WidthFixed, 120);
+        ImGui::TableSetupColumn("十六进制", ImGuiTableColumnFlags_WidthFixed, 120);
+        ImGui::TableSetupColumn("助记符", ImGuiTableColumnFlags_WidthFixed, 100);
+        ImGui::TableSetupColumn("操作数", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        
+        for (const auto& instr : result.instructions) {
+            bool isCurrentPC = (instr.address == pcAddress);
+            
+            ImGui::TableNextRow();
+            
+            // 如果是当前PC，高亮显示整行
+            if (isCurrentPC) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, 
+                    ImGui::GetColorU32(ImVec4(0.3f, 0.5f, 0.3f, 0.4f)));
+            }
+            
+            // 标记列 - 显示PC指示器
+            ImGui::TableSetColumnIndex(0);
+            if (isCurrentPC) {
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "=>");
+            } else {
+                ImGui::TextDisabled("  ");
+            }
+            
+            // 地址列
+            ImGui::TableSetColumnIndex(1);
+            char addrStr[32];
+            snprintf(addrStr, sizeof(addrStr), "0x%llX", instr.address);
+            
+            // 当前PC用不同颜色显示
+            if (isCurrentPC) {
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", addrStr);
+            } else {
+                if (ImGui::Selectable(addrStr, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                    if (viewer) {
+                        viewer->jumpToAddress(instr.address);
+                        Gui::log("跳转到地址: 0x%llX", instr.address);
+                    }
+                }
+            }
+            
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("地址: 0x%llX\n大小: %u 字节%s", 
+                                 instr.address, instr.size,
+                                 isCurrentPC ? "\n[当前PC]" : "");
+            }
+            
+            // 右键菜单
+            char popup_id[64];
+            snprintf(popup_id, sizeof(popup_id), "DisasmPCPopup_%llX", instr.address);
+            if (ImGui::BeginPopupContextItem(popup_id)) {
+                if (ImGui::MenuItem("复制地址")) {
+                    ImGui::SetClipboardText(addrStr);
+                }
+                if (ImGui::MenuItem("复制指令")) {
+                    ImGui::SetClipboardText(instr.fullInstruction.c_str());
+                }
+                if (ImGui::MenuItem("复制十六进制")) {
+                    ImGui::SetClipboardText(instr.hexBytes.c_str());
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("在内存查看器中打开")) {
+                    MemoryViewerWindow* viewer = ensureMemoryViewerWindow();
+                    if (viewer) {
+                        viewer->jumpToAddress(instr.address);
+                    }
+                }
+                ImGui::EndPopup();
+            }
+            
+            // 十六进制字节列
+            ImGui::TableSetColumnIndex(2);
+            if (isCurrentPC) {
+                ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.5f, 1.0f), "%s", instr.hexBytes.c_str());
+            } else {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", instr.hexBytes.c_str());
+            }
+            
+            // 助记符列
+            ImGui::TableSetColumnIndex(3);
+            if (isCurrentPC) {
+                ImGui::TextColored(ImVec4(0.8f, 1.0f, 0.6f, 1.0f), "%s", instr.mnemonic.c_str());
+            } else {
+                ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.8f, 1.0f), "%s", instr.mnemonic.c_str());
+            }
+            
+            // 操作数列
+            ImGui::TableSetColumnIndex(4);
+            if (!instr.operands.empty()) {
+                if (isCurrentPC) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%s", instr.operands.c_str());
+                } else {
+                    ImGui::Text("%s", instr.operands.c_str());
+                }
+            } else {
+                ImGui::TextDisabled("-");
+            }
+        }
+        
+        ImGui::EndTable();
+    }
+    
+    // 显示说明
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "提示: => 标记表示当前PC位置");
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "右键点击指令可复制或在内存查看器中查看");
+}

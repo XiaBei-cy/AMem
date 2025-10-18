@@ -1,0 +1,20 @@
+#pragma once
+
+#include <string>
+
+class Window {
+public:
+	bool pOpen = true;
+	bool shouldBringToFront = false;
+
+	const long long UID{(long long)this};
+	std::string name = "Unnamed window";
+
+	Window() = default;
+	virtual ~Window() = default;
+
+	virtual void onDraw() {}
+	virtual unsigned int getWindowFlags() const { return 0; }
+	virtual void draw();
+	void operator()();
+}; 
