@@ -10,6 +10,12 @@ option(USE_DX12 "Use DirectX 12 backend" ON)
 
 message(STATUS "CMAKE_SOURCE_DIR: ${CMAKE_SOURCE_DIR}")
 
+
+#设置输出目录
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
+
 # 查找 Capstone 库
 set(CAPSTONE_ROOT "C:/Program Files/capstone" CACHE PATH "Capstone installation directory")
 
