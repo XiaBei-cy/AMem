@@ -442,45 +442,10 @@ set(CAPSTONE_ROOT "C:/Program Files/capstone" CACHE PATH "Capstone installation 
 - 查看异常处理器输出的描述信息
 ```
 
----
-
-## 📊 性能优化
-
-### 指针扫描性能
-
-| 配置 | 单线程 | 4线程 | 8线程 | 加速比 |
-|------|--------|-------|-------|--------|
-| 深度5 | 10s | 3.2s | 2.1s | 3.1x / 4.8x |
-| 深度7 | 45s | 14s | 9s | 3.2x / 5.0x |
-| 深度10 | 180s | 52s | 32s | 3.5x / 5.6x |
-
-**优化建议**：
-- 首次扫描建议深度 5-7
-- 线程数设置为 CPU 核心数的 0.75-1 倍
-- 限制最大偏移量可显著提升速度
-
----
 
 ## 🤝 贡献指南
 
 欢迎提交 Issue 和 Pull Request！
-
-### 开发环境设置
-
-1. Fork 本仓库
-2. 克隆到本地：`git clone <your-fork-url>`
-3. 创建功能分支：`git checkout -b feature/your-feature`
-4. 提交更改：`git commit -m "Add some feature"`
-5. 推送到分支：`git push origin feature/your-feature`
-6. 创建 Pull Request
-
-### 代码规范
-
-- 遵循 C++17 标准
-- 使用 4 空格缩进
-- 变量命名：camelCase
-- 类名：PascalCase
-- 常量：UPPER_CASE
 
 
 ## 🙏 致谢
@@ -493,6 +458,5 @@ set(CAPSTONE_ROOT "C:/Program Files/capstone" CACHE PATH "Capstone installation 
 
 **⭐ 如果这个项目对你有帮助，请给一个 Star！**
 
-Made with ❤️ by Android ModEngine Team
 
 </div>
