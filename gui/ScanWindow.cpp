@@ -765,10 +765,11 @@ void ScanWindow::drawResultsPanel()
     ImGui::BeginChild("ScanResults", ImVec2(0, ImGui::GetContentRegionAvail().y * 0.5f), ImGuiChildFlags_Borders);
     
     // 自动刷新控制（使用异步版本，避免卡顿）
+    // 注意：扫描进行时不允许刷新，防止Socket操作冲突
     bool shouldRefresh = false;
     {
         std::lock_guard<std::mutex> lock(scanResultsMutex);
-        shouldRefresh = autoRefreshScanResults && !scanResults.empty() && !scanResultsRefreshing;
+        shouldRefresh = autoRefreshScanResults && !scanResults.empty() && !scanResultsRefreshing && !scanInProgress;
     }
     
     if (shouldRefresh) {
@@ -785,12 +786,17 @@ void ScanWindow::drawResultsPanel()
     
     if (totalScanResults > 0) {
         // 刷新控制工具栏
-        if (scanResultsRefreshing) {
+        // 注意：扫描进行时禁用刷新按钮
+        if (scanResultsRefreshing || scanInProgress) {
             ImGui::BeginDisabled();
-            ImGui::Button("刷新中...");
+            if (scanInProgress) {
+                ImGui::Button("扫描中...");
+            } else {
+                ImGui::Button("刷新中...");
+            }
             ImGui::EndDisabled();
             // 显示进度
-            if (refreshTotal > 0) {
+            if (refreshTotal > 0 && scanResultsRefreshing) {
                 ImGui::SameLine();
                 ImGui::Text("(%d/%d)", refreshProgress.load(), refreshTotal.load());
             }
@@ -1563,7 +1569,8 @@ void ScanWindow::drawAddressListPanel()
     ImGui::BeginChild("AddressList", ImVec2(0, 0), ImGuiChildFlags_Borders);
     
     // 自动刷新控制（使用异步版本，避免卡顿）
-    if (autoRefreshAddressList && !addressList.empty() && !addressListRefreshing) {
+    // 注意：扫描进行时不允许刷新，防止Socket操作冲突
+    if (autoRefreshAddressList && !addressList.empty() && !addressListRefreshing && !scanInProgress) {
         timeSinceAddressListRefresh += ImGui::GetIO().DeltaTime;
         if (timeSinceAddressListRefresh >= addressListRefreshInterval) {
             refreshAddressValuesAsync();  // 使用异步版本
@@ -1572,11 +1579,16 @@ void ScanWindow::drawAddressListPanel()
     }
     
     // 工具栏
-    if (addressListRefreshing) {
+    // 注意：扫描进行时禁用刷新按钮
+    if (addressListRefreshing || scanInProgress) {
         ImGui::BeginDisabled();
-        ImGui::Button("刷新中...");
+        if (scanInProgress) {
+            ImGui::Button("扫描中...");
+        } else {
+            ImGui::Button("刷新中...");
+        }
         ImGui::EndDisabled();
-        if (refreshTotal > 0) {
+        if (refreshTotal > 0 && addressListRefreshing) {
             ImGui::SameLine();
             ImGui::Text("(%d/%d)", refreshProgress.load(), refreshTotal.load());
         }
@@ -1873,6 +1885,11 @@ void ScanWindow::refreshAddressValues()
 
 void ScanWindow::refreshAddressValuesAsync()
 {
+    // 双重检查：如果正在扫描，不允许刷新（防止Socket操作冲突）
+    if (scanInProgress) {
+        return;
+    }
+    
     // 如果已经在刷新，不启动新的刷新
     if (addressListRefreshing) {
         return;
@@ -2086,6 +2103,11 @@ void ScanWindow::refreshScanResultsValues()
 
 void ScanWindow::refreshScanResultsValuesAsync()
 {
+    // 双重检查：如果正在扫描，不允许刷新（防止Socket操作冲突）
+    if (scanInProgress) {
+        return;
+    }
+    
     // 如果已经在刷新，不启动新的刷新
     if (scanResultsRefreshing) {
         return;
