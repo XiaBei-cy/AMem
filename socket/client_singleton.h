@@ -79,7 +79,17 @@ typedef void(*ScanProgressCallback)(float progress, uint64_t matchCount, uint64_
 int ScanValueWithProgress(uint32_t flags, std::vector<unsigned char>& Value, ScanProgressCallback callback, void* userData, uint64_t start = 0, uint64_t end = UINT64_MAX);
 int ScanNextValueWithProgress(std::vector<unsigned char>& Value, int flag, ScanProgressCallback callback, void* userData, uint64_t start = 0, uint64_t end = UINT64_MAX); 
 int ScanFuzzyValueWithProgress(uint32_t flags, ScanProgressCallback callback, void* userData, uint64_t start = 0, uint64_t end = UINT64_MAX);
-
+int ScanGroupValueWithProgress(
+    std::vector<std::pair<std::vector<unsigned char>,
+                          std::pair<char, char>> /*value,size,type*/> &Value,
+    bool order /*是否按地址排序*/, ScanProgressCallback callback,
+    void *userData, uint64_t start, uint64_t end);
+int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
+	std::vector<unsigned char> &Value,
+	ScanProgressCallback callback,void *userData);
+bool GetTypedScanResult(
+	int offset, int count,
+	std::vector<std::tuple<uint64_t, uint64_t, short>> &results);
 
 //内核断点相关
 bool SetKernelBreakpoint(uint64_t address, uint32_t bpType, uint32_t bpSize);

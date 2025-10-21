@@ -700,6 +700,220 @@ int ScanFuzzyValueWithProgress(uint32_t flags, ScanProgressCallback callback,
   return success ? len : 0;
 }
 
+
+/*
+500D;1f;6.0double;...
+--> 500,4,4
+ -> 1, 4 ,8
+ -> 6.0,8 ,16
+*/
+int ScanGroupValueWithProgress(
+    std::vector<std::pair<std::vector<unsigned char>,
+                          std::pair<char, char>> /*value,size,type*/> &Value,
+    bool order /*是否按地址排序*/, ScanProgressCallback callback,
+    void *userData, uint64_t start, uint64_t end) {
+  WindowsSocketClient &client = GetSocketClient();
+  if (!client.IsConnected())
+    return 0;
+  int handle = 0;
+  if (!EnsureOpenHandle(handle))
+    return 0;
+  int SearchCount = 0;
+  bool success =
+      SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+        unsigned char command = CMD_SCANGROUPVALUE;
+        if (!client.Send(&command, sizeof(command)))
+          return false;
+        if (!client.Send(&handle, sizeof(handle)))
+          return false;
+
+#pragma pack(1)
+        struct {
+          uint64_t start;
+          uint64_t end;
+          char order;
+          int len;
+        } scanParams;
+#pragma pack()
+
+        int len = Value.size();
+
+        scanParams.start = start;
+        scanParams.end = end;
+        scanParams.order = order;
+        scanParams.len = len;
+        client.Send(&scanParams, sizeof(scanParams));
+
+        // 类型数组
+        std::vector<char> types;
+        for (auto &it : Value) {
+          types.push_back(it.second.second);
+        }
+        client.Send(types.data(), types.size());
+
+        // 数据大小数组
+        std::vector<char> sizes;
+        for (auto &it : Value) {
+          sizes.push_back(it.second.first);
+        }
+        client.Send(sizes.data(), sizes.size());
+
+        // 数据数组
+        for (int i = 0; i < len; i++) {
+          client.Send(Value[i].first.data(), sizes[i]);
+        }
+
+        // 进度回调循环
+        while (true) {
+          ScanProgress progress;
+          if (!client.Receive(&progress, sizeof(progress))) {
+            break;
+          }
+
+          if (callback) {
+            callback(progress.percent, progress.matchCount,
+                     progress.scannedBytes, progress.totalBytes, userData);
+          }
+
+          if (progress.msgType == 2) { // 扫描完成
+            break;
+          } else if (progress.msgType == 3) { // 扫描出错
+            return false;
+          }
+        }
+
+        if (!client.Receive(&SearchCount, sizeof(SearchCount)))
+          return false;
+        return true;
+      });
+
+  return success ? SearchCount : 0;
+}
+
+/*
+hex: 03 44 ? ? dd...
+*/
+int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
+                             std::vector<unsigned char> &Value,
+                             ScanProgressCallback callback,void *userData) {
+  WindowsSocketClient &client = GetSocketClient();
+  if (!client.IsConnected())
+    return 0;
+
+  int handle = 0;
+
+  if (!EnsureOpenHandle(handle))
+    return 0;
+
+  // 使用请求管理器保护整个扫描和进度接收过程
+  int len = 0;
+  bool success =
+      SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+        unsigned char command = CMD_SCANHEX;
+        if (!client.Send(&command, sizeof(command)))
+          return false;
+        if (!client.Send(&handle, sizeof(handle)))
+          return false;
+
+#pragma pack(1)
+        struct {
+          uint64_t start;
+          uint64_t end;
+          int size;
+        } scanParams;
+#pragma pack()
+
+        scanParams.start = start;
+        scanParams.end = end;
+        scanParams.size = Value.size();
+        client.Send(&scanParams, sizeof(scanParams));
+        client.Send(Value.data(), Value.size());
+
+        // 进度回调循环
+        while (true) {
+          ScanProgress progress;
+          if (!client.Receive(&progress, sizeof(progress))) {
+            break;
+          }
+
+          if (callback) {
+            callback(progress.percent, progress.matchCount,
+                     progress.scannedBytes, progress.totalBytes, userData);
+          }
+
+          if (progress.msgType == 2) { // 扫描完成
+            break;
+          } else if (progress.msgType == 3) { // 扫描出错
+            return false;
+          }
+        }
+
+        if (!client.Receive(&len, sizeof(len)))
+          return false;
+        return true;
+      });
+
+  return success ? len : 0;
+}
+
+
+/*
+获取有类型标志得结果，比如联合搜索，hex搜索
+ std::vector<std::tuple<uint64_t, uint64_t, short>> results 
+                         地址        值      类型标志
+*/
+bool GetTypedScanResult(
+    int offset, int count,
+    std::vector<std::tuple<uint64_t, uint64_t, short>> &results) {
+  WindowsSocketClient &client = GetSocketClient();
+  if (!client.IsConnected())
+    return false;
+  int handle = 0;
+  if (!EnsureOpenHandle(handle))
+    return false;
+
+  // 使用请求管理器保护Socket操作，防止与ScanWindow自动刷新冲突
+  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+    unsigned char command = CMD_GETSCAN_TYPE_RESULT;
+    if (!client.Send(&command, sizeof(command)))
+      return false;
+    if (!client.Send(&handle, sizeof(handle)))
+      return false;
+
+    CeGetScanResultInput input;
+    input.offset = offset;
+    input.count = count;
+    if (!client.Send(&input, sizeof(input)))
+      return false;
+
+    CeGetScanResultOutput output;
+    if (!client.Receive(&output, sizeof(output)))
+      return false;
+    if (output.actual_count == 0)
+      return false;
+
+
+	for (int i = 0; i < output.actual_count; i++) {
+		uint64_t addr;
+		uint64_t value;
+		short type;
+		client.Receive(&addr, sizeof(addr));
+		client.Receive(&value, sizeof(value));
+		client.Receive(&type, sizeof(type));
+		results.push_back(std::make_tuple(addr, value, type));
+	}
+
+    return true;
+  });
+}
+
+
+
+
+
+
+
+
 bool ReadProcessMemoryBytes(uint64_t address, uint32_t size,
                             std::vector<unsigned char> &out) {
   WindowsSocketClient &client = GetSocketClient();
