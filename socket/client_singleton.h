@@ -56,8 +56,7 @@ public:
   std::mutex *GetMutex(PortType type);
 
   // 连接到服务器的所有端口
-  bool ConnectMultiPort(const std::string &host, uint16_t mainPort,
-                        uint16_t debugPort = 0, uint16_t errorPort = 0);
+  bool ConnectMultiPort(const std::string &host, uint16_t Port);
 
   // 断开所有端口
   void DisconnectMultiPort();
@@ -74,9 +73,8 @@ inline WinSocketClientMgr &GetSocketMgr() {
 }
 
 // 便捷函数（直接调用WinSocketClientMgr的方法）
-inline bool ConnectMultiPort(const std::string &host, uint16_t mainPort,
-                             uint16_t debugPort = 0, uint16_t errorPort = 0) {
-  return GetSocketMgr().ConnectMultiPort(host, mainPort, debugPort, errorPort);
+inline bool ConnectMultiPort(const std::string &host, uint16_t Port) {
+  return GetSocketMgr().ConnectMultiPort(host, Port);
 }
 
 inline void DisconnectMultiPort() { GetSocketMgr().DisconnectMultiPort(); }

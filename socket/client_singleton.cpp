@@ -42,35 +42,27 @@ std::mutex *WinSocketClientMgr::GetMutex(PortType type) {
   }
 }
 
-bool WinSocketClientMgr::ConnectMultiPort(const std::string &host,
-                                          uint16_t mainPort, uint16_t debugPort,
-                                          uint16_t errorPort) {
-  // 计算默认端口
-  if (debugPort == 0)
-    debugPort = mainPort + 1;
-  if (errorPort == 0)
-    errorPort = mainPort + 2;
+bool WinSocketClientMgr::ConnectMultiPort(const std::string &host, uint16_t Port) {
+
 
   std::cout << "[MultiPort] Connecting to server..." << std::endl;
-  std::cout << "  Main:  " << host << ":" << mainPort << std::endl;
-  std::cout << "  Debug: " << host << ":" << debugPort << std::endl;
-  std::cout << "  Error: " << host << ":" << errorPort << std::endl;
+  std::cout << "  Main:  " << host << ":" << Port << std::endl;
 
   // 连接主端口
-  if (!m_main_client.Connect(host, mainPort)) {
+  if (!m_main_client.Connect(host, Port)) {
     std::cerr << "[MultiPort] Failed to connect MAIN port" << std::endl;
     return false;
   }
 
   // 连接调试端口
-  if (!m_debug_client.Connect(host, debugPort)) {
+  if (!m_debug_client.Connect(host, Port)) {
     std::cerr << "[MultiPort] Failed to connect DEBUG port" << std::endl;
     m_main_client.Close();
     return false;
   }
 
   // 连接错误端口
-  if (!m_error_client.Connect(host, errorPort)) {
+  if (!m_error_client.Connect(host, Port)) {
     std::cerr << "[MultiPort] Failed to connect ERROR port" << std::endl;
     m_main_client.Close();
     m_debug_client.Close();
