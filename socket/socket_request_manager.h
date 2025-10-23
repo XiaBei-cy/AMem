@@ -17,6 +17,7 @@
  * 
  * 解决方案：
  * - 使用互斥锁确保每次Socket请求-响应操作是原子的
+ * - 支持自定义锁，允许为不同端口使用独立的锁，减少锁争用
  * - 防止多个线程同时访问Socket导致数据错乱
  */
 class SocketRequestManager {
@@ -31,7 +32,7 @@ public:
     SocketRequestManager& operator=(const SocketRequestManager&) = delete;
 
     /**
-     * 执行一个Socket请求
+     * 执行一个Socket请求（使用内部全局锁）
      * @param request 请求执行函数（包含Send和Receive操作）
      * @return 请求是否成功
      * 
@@ -49,9 +50,37 @@ public:
         std::lock_guard<std::mutex> lock(requestMutex_);
         return request();
     }
+    
+    /**
+     * 执行一个Socket请求（使用自定义锁）
+     * @param customMutex 自定义互斥锁（例如端口专属锁）
+     * @param request 请求执行函数（包含Send和Receive操作）
+     * @return 请求是否成功
+     * 
+     * 使用示例：
+     * std::mutex* portMutex = GetSocketMgr().GetMutex(PORT_MAIN);
+     * bool result = manager.ExecuteRequestWithLock(portMutex, [&]() -> bool {
+     *     // 发送命令到主端口
+     *     if (!client->Send(&command, sizeof(command))) return false;
+     *     // 接收响应
+     *     if (!client->Receive(&response, sizeof(response))) return false;
+     *     return true;
+     * });
+     * 
+     * 优势：不同端口使用不同的锁，减少锁争用，提高并发性能
+     */
+    template<typename RequestFunc>
+    bool ExecuteRequestWithLock(std::mutex* customMutex, RequestFunc request) {
+        if (!customMutex) {
+            // 如果未提供自定义锁，使用全局锁
+            return ExecuteRequest(request);
+        }
+        std::lock_guard<std::mutex> lock(*customMutex);
+        return request();
+    }
 
     /**
-     * 尝试执行Socket请求（带超时）
+     * 尝试执行Socket请求（带超时，使用内部全局锁）
      * @param request 请求执行函数
      * @param timeoutMs 超时时间（毫秒）
      * @return 请求是否成功
@@ -62,6 +91,40 @@ public:
         
         // 尝试获取锁
         std::unique_lock<std::mutex> lock(requestMutex_, std::defer_lock);
+        
+        while (!lock.try_lock()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start
+            ).count();
+            
+            if (elapsed > timeoutMs) {
+                return false; // 超时
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        return request();
+    }
+    
+    /**
+     * 尝试执行Socket请求（带超时，使用自定义锁）
+     * @param customMutex 自定义互斥锁
+     * @param request 请求执行函数
+     * @param timeoutMs 超时时间（毫秒）
+     * @return 请求是否成功
+     */
+    template<typename RequestFunc>
+    bool TryExecuteRequestWithLock(std::mutex* customMutex, RequestFunc request, int timeoutMs = 5000) {
+        if (!customMutex) {
+            // 如果未提供自定义锁，使用全局锁
+            return TryExecuteRequest(request, timeoutMs);
+        }
+        
+        auto start = std::chrono::steady_clock::now();
+        
+        // 尝试获取自定义锁
+        std::unique_lock<std::mutex> lock(*customMutex, std::defer_lock);
         
         while (!lock.try_lock()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -99,3 +162,10 @@ private:
 
 #define TRY_EXECUTE_SOCKET_REQUEST(request, timeout) \
     SocketRequestManager::GetInstance().TryExecuteRequest([&]() -> bool { return (request); }, timeout)
+
+// 使用自定义锁的便捷宏
+#define EXECUTE_SOCKET_REQUEST_WITH_LOCK(mutex, request) \
+    SocketRequestManager::GetInstance().ExecuteRequestWithLock(mutex, [&]() -> bool { return (request); })
+
+#define TRY_EXECUTE_SOCKET_REQUEST_WITH_LOCK(mutex, request, timeout) \
+    SocketRequestManager::GetInstance().TryExecuteRequestWithLock(mutex, [&]() -> bool { return (request); }, timeout)

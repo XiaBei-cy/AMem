@@ -246,11 +246,6 @@ public:
     bool IsConnected() const { return connected_; }
 };
 
-// 全局变量
-static int gpid = 0;
-static int ghandle = 0;
-static uint64_t gbase = 0;
-
 
 static void CloseServer(WindowsSocketClient& client) {
     std::cout << "\n=== Closing Server ===" << std::endl;

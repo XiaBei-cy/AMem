@@ -1,67 +1,161 @@
 #include "client_singleton.h"
 #include "client.hpp"
 #include "socket_request_manager.h"
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 
 
-static WindowsSocketClient g_client_singleton;
+// ==================== 全局变量 ====================
 static int g_selected_pid = 0;
 static int g_process_handle = 0;
-static uint64_t g_selected_base = 0; // optional
 
-WindowsSocketClient &GetSocketClient() { return g_client_singleton; }
-
-bool GetMemType(int &outType) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
-    return false;
-
-  // 使用请求管理器保护Socket操作，防止与其他窗口的自动刷新冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_GETARCHITECTURE;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    unsigned char type = 0;
-    if (!client.Receive(&type, sizeof(type)))
-      return false;
-    outType = type;
-    return true;
-  });
+WindowsSocketClient *WinSocketClientMgr::GetClient(PortType type) {
+  // 快速路径：直接返回指针，无额外检查
+  switch (type) {
+  case PORT_MAIN:
+    return &m_main_client;
+  case PORT_DEBUG:
+    return &m_debug_client;
+  case PORT_ERROR:
+    return &m_error_client;
+  default:
+    return nullptr;
+  }
 }
 
-bool InitDriver(std::string &Card, std::string &resStr) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+std::mutex *WinSocketClientMgr::GetMutex(PortType type) {
+  switch (type) {
+  case PORT_MAIN:
+    return &m_main_mutex;
+  case PORT_DEBUG:
+    return &m_debug_mutex;
+  case PORT_ERROR:
+    return &m_error_mutex;
+  default:
+    return nullptr;
+  }
+}
+
+bool WinSocketClientMgr::ConnectMultiPort(const std::string &host,
+                                          uint16_t mainPort, uint16_t debugPort,
+                                          uint16_t errorPort) {
+  // 计算默认端口
+  if (debugPort == 0)
+    debugPort = mainPort + 1;
+  if (errorPort == 0)
+    errorPort = mainPort + 2;
+
+  std::cout << "[MultiPort] Connecting to server..." << std::endl;
+  std::cout << "  Main:  " << host << ":" << mainPort << std::endl;
+  std::cout << "  Debug: " << host << ":" << debugPort << std::endl;
+  std::cout << "  Error: " << host << ":" << errorPort << std::endl;
+
+  // 连接主端口
+  if (!m_main_client.Connect(host, mainPort)) {
+    std::cerr << "[MultiPort] Failed to connect MAIN port" << std::endl;
+    return false;
+  }
+
+  // 连接调试端口
+  if (!m_debug_client.Connect(host, debugPort)) {
+    std::cerr << "[MultiPort] Failed to connect DEBUG port" << std::endl;
+    m_main_client.Close();
+    return false;
+  }
+
+  // 连接错误端口
+  if (!m_error_client.Connect(host, errorPort)) {
+    std::cerr << "[MultiPort] Failed to connect ERROR port" << std::endl;
+    m_main_client.Close();
+    m_debug_client.Close();
+    return false;
+  }
+
+  // 使用原子操作设置连接状态
+  m_connected.store(true, std::memory_order_release);
+  std::cout << "[MultiPort] All ports connected successfully!" << std::endl;
+  return true;
+}
+
+void WinSocketClientMgr::DisconnectMultiPort() {
+  // 使用原子操作检查和设置状态
+  if (!m_connected.load(std::memory_order_acquire))
+    return;
+
+  m_main_client.Close();
+  m_debug_client.Close();
+  m_error_client.Close();
+  m_connected.store(false, std::memory_order_release);
+
+  std::cout << "[MultiPort] All ports disconnected" << std::endl;
+}
+
+bool WinSocketClientMgr::IsMultiPortConnected() {
+  // 快速检查：使用原子操作，避免不必要的函数调用
+  if (!m_connected.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  // 只有在标志为true时才检查实际连接状态
+  return m_main_client.IsConnected() && m_debug_client.IsConnected() &&
+         m_error_client.IsConnected();
+}
+
+bool GetMemType(int &outType, PortType type) {
+  auto client = GetSocketMgr().GetClient(type);
+  if (!client->IsConnected())
     return false;
 
-  // 使用请求管理器保护Socket操作
+  auto portMutex = GetSocketMgr().GetMutex(type);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_GETARCHITECTURE;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        unsigned char type = 0;
+        if (!client->Receive(&type, sizeof(type)))
+          return false;
+        outType = type;
+        return true;
+      });
+}
+
+bool InitDriver(std::string &Card, std::string &resStr, PortType type) {
+  auto client = GetSocketMgr().GetClient(type);
+  if (!client->IsConnected())
+    return false;
+
+  auto portMutex = GetSocketMgr().GetMutex(type);
   int ret = 0;
   int resStrlen = 0;
   std::vector<char> resStrVec;
 
-  bool success =
-      SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
         unsigned char command = CMD_INITRWDRIVER;
-        if (!client.Send(&command, sizeof(command)))
+        if (!client->Send(&command, sizeof(command)))
           return false;
         int Cardlen = Card.size();
-        if (!client.Send(&Cardlen, sizeof(Cardlen)))
+        if (!client->Send(&Cardlen, sizeof(Cardlen)))
           return false;
-        if (!client.Send(Card.data(), Card.size()))
+        if (!client->Send(Card.data(), Card.size()))
           return false;
 
         // 0失败（str 错误信息） 1成功 2模块已加载 （都是时间戳）
-        if (!client.Receive(&ret, sizeof(ret)))
+        if (!client->Receive(&ret, sizeof(ret)))
           return false;
-        if (!client.Receive(&resStrlen, sizeof(resStrlen)))
+        if (!client->Receive(&resStrlen, sizeof(resStrlen)))
           return false;
         if (resStrlen == 0)
           return false;
         resStrVec.resize(resStrlen);
-        if (!client.Receive(resStrVec.data(), resStrlen))
+        if (!client->Receive(resStrVec.data(), resStrlen))
           return false;
         return true;
       });
@@ -106,251 +200,257 @@ void SetCurrentPid(int pid) { g_selected_pid = pid; }
 
 int GetCurrentPid() { return g_selected_pid; }
 
-bool OpenProcessHandle(int pid, int &outHandle) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool OpenProcessHandle(int pid, int &outHandle, PortType type) {
+  auto client = GetSocketMgr().GetClient(type);
+  if (!client->IsConnected())
     return false;
 
-  // 使用请求管理器保护Socket操作
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  auto portMutex = GetSocketMgr().GetMutex(type);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
 #pragma pack(1)
-    struct {
-      unsigned char command;
-      int pid;
-    } op;
+        struct {
+          unsigned char command;
+          int pid;
+        } op;
 #pragma pack()
-    op.command = CMD_OPENPROCESS;
-    op.pid = pid;
-    if (!client.Send(&op, sizeof(op)))
-      return false;
-    int handle = 0;
-    if (!client.Receive(&handle, sizeof(handle)))
-      return false;
-    outHandle = handle;
-    g_process_handle = handle;
-    return true;
-  });
+        op.command = CMD_OPENPROCESS;
+        op.pid = pid;
+        if (!client->Send(&op, sizeof(op)))
+          return false;
+        int handle = 0;
+        if (!client->Receive(&handle, sizeof(handle)))
+          return false;
+        outHandle = handle;
+        g_process_handle = handle;
+        return true;
+      });
 }
 
-bool EnsureOpenHandle(int &outHandle) {
+bool EnsureOpenHandle(int &outHandle, PortType type) {
   if (g_process_handle) {
     outHandle = g_process_handle;
     return true;
   }
   if (g_selected_pid == 0)
     return false;
-  return OpenProcessHandle(g_selected_pid, outHandle);
+  return OpenProcessHandle(g_selected_pid, outHandle, type);
 }
 
-bool FetchServerVersion(ServerVersionInfo &outInfo) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool FetchServerVersion(ServerVersionInfo &outInfo, PortType type) {
+  auto client = GetSocketMgr().GetClient(type);
+  if (!client->IsConnected())
     return false;
 
-  // 使用请求管理器保护Socket操作
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_GETVERSION;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(type);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_GETVERSION;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
 
-    CeVersion version{};
-    if (!client.Receive(&version, sizeof(version)))
-      return false;
-    outInfo.version = version.version;
-    outInfo.versionString.clear();
-    if (version.stringsize > 0) {
-      std::vector<char> versionString(version.stringsize);
-      if (client.Receive(versionString.data(), versionString.size())) {
-        outInfo.versionString.assign(versionString.data(),
-                                     versionString.size());
-      }
-    }
-    return true;
-  });
+        CeVersion version{};
+        if (!client->Receive(&version, sizeof(version)))
+          return false;
+        outInfo.version = version.version;
+        outInfo.versionString.clear();
+        if (version.stringsize > 0) {
+          std::vector<char> versionString(version.stringsize);
+          if (client->Receive(versionString.data(), versionString.size())) {
+            outInfo.versionString.assign(versionString.data(),
+                                         versionString.size());
+          }
+        }
+        return true;
+      });
 }
 
-bool FetchProcessList(std::vector<ProcessInfoItem> &outList) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool FetchProcessList(std::vector<ProcessInfoItem> &outList, PortType type) {
+  auto client = GetSocketMgr().GetClient(type);
+  if (!client->IsConnected())
     return false;
 
-  // 使用请求管理器保护Socket操作，防止与其他窗口的操作冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_GETPROCESSLIST;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(type);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_GETPROCESSLIST;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
 
-    int len = 0;
-    if (!client.Receive(&len, 4))
-      return false;
+        int len = 0;
+        if (!client->Receive(&len, 4))
+          return false;
 
-    outList.clear();
-    while (len--) {
-      struct {
-        int pid;
-        int size;
-      } proc{};
-      if (!client.Receive(&proc, sizeof(proc)))
-        break;
+        outList.clear();
+        while (len--) {
+          struct {
+            int pid;
+            int size;
+          } proc{};
+          if (!client->Receive(&proc, sizeof(proc)))
+            break;
 
-      std::vector<char> name(proc.size);
-      if (!client.Receive(name.data(), proc.size))
-        break;
+          std::vector<char> name(proc.size);
+          if (!client->Receive(name.data(), proc.size))
+            break;
 
-      ProcessInfoItem item{};
-      item.pid = proc.pid;
-      item.name.assign(name.data(), name.size());
-      outList.push_back(std::move(item));
-    }
-    return true;
-  });
+          ProcessInfoItem item{};
+          item.pid = proc.pid;
+          item.name.assign(name.data(), name.size());
+          outList.push_back(std::move(item));
+        }
+        return true;
+      });
 }
 
-bool FetchModuleList(std::vector<ModuleInfoItem> &outList) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool FetchModuleList(std::vector<ModuleInfoItem> &outList, PortType type) {
+  auto client = GetSocketMgr().GetClient(type);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
-  // 使用请求管理器保护Socket操作，防止与其他窗口的操作冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_GETMODULELIST;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(type);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_GETMODULELIST;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
-    int len = 0;
-    if (!client.Receive(&len, 4))
-      return false;
+        int len = 0;
+        if (!client->Receive(&len, 4))
+          return false;
 
-    CeModuleListEntry entry{};
-    outList.clear();
-    int magic = 0x1145;
-    while (len > 0) {
-      if (!client.Receive(&magic, sizeof(magic)))
-        return false;
-      if (magic != 0x1145)
-        return false;
-      std::memset(&entry, 0, sizeof(entry));
-      if (!client.Receive(&entry, sizeof(entry)))
-        break;
+        CeModuleListEntry entry{};
+        outList.clear();
+        int magic = 0x1145;
+        while (len > 0) {
+          if (!client->Receive(&magic, sizeof(magic)))
+            return false;
+          if (magic != 0x1145)
+            return false;
+          std::memset(&entry, 0, sizeof(entry));
+          if (!client->Receive(&entry, sizeof(entry)))
+            break;
 
-      std::vector<char> name(entry.modulenamesize);
-      if (!client.Receive(name.data(), entry.modulenamesize))
-        break;
-      ModuleInfoItem mi{};
-      mi.base = entry.modulebase;
-      mi.size = entry.modulesize;
-      mi.type = entry.result;
-      mi.flag = entry.flag;
-      mi.name = ""; // A类为空
-      if (entry.modulenamesize > 0) {
-        mi.name.assign(name.data(), entry.modulenamesize);
-      }
-      outList.push_back(std::move(mi));
-      len--;
-    }
+          std::vector<char> name(entry.modulenamesize);
+          if (!client->Receive(name.data(), entry.modulenamesize))
+            break;
+          ModuleInfoItem mi{};
+          mi.base = entry.modulebase;
+          mi.size = entry.modulesize;
+          mi.type = entry.result;
+          mi.flag = entry.flag;
+          mi.name = ""; // A类为空
+          if (entry.modulenamesize > 0) {
+            mi.name.assign(name.data(), entry.modulenamesize);
+          }
+          outList.push_back(std::move(mi));
+          len--;
+        }
 
-    return true;
-  });
+        return true;
+      });
 }
 
-bool ScanSetRange(int type) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool ScanSetRange(int type, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
-  // 使用请求管理器保护Socket操作
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_SETRANGE;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
-    if (!client.Send(&type, sizeof(type)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_SETRANGE;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+        if (!client->Send(&type, sizeof(type)))
+          return false;
 
-    return true;
-  });
+        return true;
+      });
 }
 
 int ScanValue(uint32_t flags, std::vector<unsigned char> &Value, uint64_t start,
-              uint64_t end) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+              uint64_t end, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
-  // 使用请求管理器保护整个扫描和进度接收过程
+  auto portMutex = GetSocketMgr().GetMutex(port);
   int len = 0;
-  bool success = SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_SCANVALUE;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_SCANVALUE;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
 #pragma pack(1)
-    struct {
-      uint64_t start;
-      uint64_t end;
-      int size;
-      unsigned int flag;
-    } scanParams;
+        struct {
+          uint64_t start;
+          uint64_t end;
+          int size;
+          unsigned int flag;
+        } scanParams;
 #pragma pack()
-    scanParams.start = start;
-    scanParams.end = end;
-    scanParams.size = Value.size();
-    scanParams.flag = flags;
-    client.Send(&scanParams, sizeof(scanParams));
+        scanParams.start = start;
+        scanParams.end = end;
+        scanParams.size = Value.size();
+        scanParams.flag = flags;
+        client->Send(&scanParams, sizeof(scanParams));
 
-    client.Send(Value.data(), Value.size());
+        client->Send(Value.data(), Value.size());
 
-    // 进度回调
-    while (true) {
-      ScanProgress progress;
-      if (!client.Receive(&progress, sizeof(progress))) {
-        std::cerr << "接收进度失败" << std::endl;
-        break;
-      }
-      if (progress.msgType == 1) {
-        std::cout << "\r进度: " << std::fixed << std::setprecision(2)
-                  << progress.percent << "%, 命中: " << progress.matchCount
-                  << " scan " << progress.scannedBytes << " total "
-                  << progress.totalBytes << std::flush;
-      } else if (progress.msgType == 2) {
-        std::cout << "\r进度: 100.00%, 命中: " << progress.matchCount << " scan "
-                  << progress.scannedBytes << " total " << progress.totalBytes
-                  << std::endl;
-        break;
-      } else if (progress.msgType == 3) {
-        std::cerr << "扫描出错" << std::endl;
-        return false;
-      }
-    }
+        // 进度回调
+        while (true) {
+          ScanProgress progress;
+          if (!client->Receive(&progress, sizeof(progress))) {
+            std::cerr << "接收进度失败" << std::endl;
+            break;
+          }
+          if (progress.msgType == 1) {
+            std::cout << "\r进度: " << std::fixed << std::setprecision(2)
+                      << progress.percent << "%, 命中: " << progress.matchCount
+                      << " scan " << progress.scannedBytes << " total "
+                      << progress.totalBytes << std::flush;
+          } else if (progress.msgType == 2) {
+            std::cout << "\r进度: 100.00%, 命中: " << progress.matchCount
+                      << " scan " << progress.scannedBytes << " total "
+                      << progress.totalBytes << std::endl;
+            break;
+          } else if (progress.msgType == 3) {
+            std::cerr << "扫描出错" << std::endl;
+            return false;
+          }
+        }
 
-    if (!client.Receive(&len, 4))
-      return false;
-    std::cout << "scan result size " << std::dec << len << std::endl;
+        if (!client->Receive(&len, 4))
+          return false;
+        std::cout << "scan result size " << std::dec << len << std::endl;
 
-    return true;
-  });
+        return true;
+      });
 
   return success ? len : 0;
 }
 
 int ScanNextValue(std::vector<unsigned char> &Value, int flag, uint64_t start,
-                  uint64_t end) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                  uint64_t end, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
@@ -358,67 +458,69 @@ int ScanNextValue(std::vector<unsigned char> &Value, int flag, uint64_t start,
 
   // 使用请求管理器保护整个扫描和进度接收过程
   int len = 0;
-  bool success = SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_SCANNEXTVALUE;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_SCANNEXTVALUE;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
     // 发送扫描参数
 #pragma pack(1)
-    struct {
-      uint64_t start;
-      uint64_t end;
-      int size;
-      unsigned int flag;
-    } scanParams;
+        struct {
+          uint64_t start;
+          uint64_t end;
+          int size;
+          unsigned int flag;
+        } scanParams;
 #pragma pack()
 
-    scanParams.start = start;
-    scanParams.end = end;
-    scanParams.size = Value.size();
-    scanParams.flag = flag;
-    client.Send(&scanParams, sizeof(scanParams));
+        scanParams.start = start;
+        scanParams.end = end;
+        scanParams.size = Value.size();
+        scanParams.flag = flag;
+        client->Send(&scanParams, sizeof(scanParams));
 
-    client.Send(Value.data(), Value.size());
+        client->Send(Value.data(), Value.size());
 
-    // 循环接收进度
-    while (true) {
-      ScanProgress progress;
-      if (!client.Receive(&progress, sizeof(progress))) {
-        std::cerr << "接收进度失败" << std::endl;
-        break;
-      }
-      if (progress.msgType == 1) {
-        std::cout << "\r进度: " << std::fixed << std::setprecision(2)
-                  << progress.percent << "%, 命中: " << progress.matchCount
-                  << " scan " << progress.scannedBytes << " total "
-                  << progress.totalBytes << std::flush;
-      } else if (progress.msgType == 2) {
-        std::cout << "\r进度: 100.00%, 命中: " << progress.matchCount << " scan "
-                  << progress.scannedBytes << " total " << progress.totalBytes
-                  << std::endl;
-        break;
-      } else if (progress.msgType == 3) {
-        std::cerr << "扫描出错" << std::endl;
-        return false;
-      }
-    }
+        // 循环接收进度
+        while (true) {
+          ScanProgress progress;
+          if (!client->Receive(&progress, sizeof(progress))) {
+            std::cerr << "接收进度失败" << std::endl;
+            break;
+          }
+          if (progress.msgType == 1) {
+            std::cout << "\r进度: " << std::fixed << std::setprecision(2)
+                      << progress.percent << "%, 命中: " << progress.matchCount
+                      << " scan " << progress.scannedBytes << " total "
+                      << progress.totalBytes << std::flush;
+          } else if (progress.msgType == 2) {
+            std::cout << "\r进度: 100.00%, 命中: " << progress.matchCount
+                      << " scan " << progress.scannedBytes << " total "
+                      << progress.totalBytes << std::endl;
+            break;
+          } else if (progress.msgType == 3) {
+            std::cerr << "扫描出错" << std::endl;
+            return false;
+          }
+        }
 
-    if (!client.Receive(&len, 4))
-      return false;
-    std::cout << "scan result size " << std::dec << len << std::endl;
+        if (!client->Receive(&len, 4))
+          return false;
+        std::cout << "scan result size " << std::dec << len << std::endl;
 
-    return true;
-  });
+        return true;
+      });
 
   return success ? len : 0;
 }
 
-int GetScanResultCount() {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+int GetScanResultCount(PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
@@ -426,103 +528,113 @@ int GetScanResultCount() {
 
   // 使用请求管理器保护Socket操作，防止与ScanWindow自动刷新冲突
   int count = 0;
-  bool success = SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_GETSCANRESULT_COUNT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
-    if (!client.Receive(&count, sizeof(count)))
-      return false;
-    return true;
-  });
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_GETSCANRESULT_COUNT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+        if (!client->Receive(&count, sizeof(count)))
+          return false;
+        return true;
+      });
   return success ? count : 0;
 }
 
 bool GetScanResult(
     int offset, int count,
-    std::vector<std::pair<uint64_t, uint64_t>> &results /*address,Value*/) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+    std::vector<std::pair<uint64_t, uint64_t>> &results /*address,Value*/,
+    PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与ScanWindow自动刷新冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_GETSCANRESULT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_GETSCANRESULT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
-    CeGetScanResultInput input;
-    input.offset = offset;
-    input.count = count;
-    if (!client.Send(&input, sizeof(input)))
-      return false;
+        CeGetScanResultInput input;
+        input.offset = offset;
+        input.count = count;
+        if (!client->Send(&input, sizeof(input)))
+          return false;
 
-    CeGetScanResultOutput output;
-    if (!client.Receive(&output, sizeof(output)))
-      return false;
-    if (output.actual_count == 0)
-      return false;
+        CeGetScanResultOutput output;
+        if (!client->Receive(&output, sizeof(output)))
+          return false;
+        if (output.actual_count == 0)
+          return false;
 
-    results.reserve(output.actual_count);
-    client.Receive(results.data(), output.actual_count * sizeof(uint64_t) * 2);
+        results.reserve(output.actual_count);
+        client->Receive(results.data(),
+                        output.actual_count * sizeof(uint64_t) * 2);
 
-    return true;
-  });
+        return true;
+      });
 }
 
-bool RemoveScanResult(std::vector<uint64_t> address) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool RemoveScanResult(std::vector<uint64_t> address, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_REMOVESCANRESULT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
-    if (!client.Send(address.data(), address.size() * sizeof(uint64_t)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_REMOVESCANRESULT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+        if (!client->Send(address.data(), address.size() * sizeof(uint64_t)))
+          return false;
 
-    return true;
-  });
+        return true;
+      });
 }
 
-bool ClearScanResult() {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool ClearScanResult(PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_CLEARSCANRESULT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_CLEARSCANRESULT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
-    return true;
-  });
+        return true;
+      });
 }
 
 int ScanValueWithProgress(uint32_t flags, std::vector<unsigned char> &Value,
                           ScanProgressCallback callback, void *userData,
-                          uint64_t start, uint64_t end) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                          uint64_t start, uint64_t end, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return 0;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
@@ -530,61 +642,63 @@ int ScanValueWithProgress(uint32_t flags, std::vector<unsigned char> &Value,
 
   // 使用请求管理器保护整个扫描和进度接收过程
   int len = 0;
-  bool success = SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_SCANVALUE;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_SCANVALUE;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
 #pragma pack(1)
-    struct {
-      uint64_t start;
-      uint64_t end;
-      int size;
-      unsigned int flag;
-    } scanParams;
+        struct {
+          uint64_t start;
+          uint64_t end;
+          int size;
+          unsigned int flag;
+        } scanParams;
 #pragma pack()
 
-    scanParams.start = start;
-    scanParams.end = end;
-    scanParams.size = Value.size();
-    scanParams.flag = flags;
-    client.Send(&scanParams, sizeof(scanParams));
-    client.Send(Value.data(), Value.size());
+        scanParams.start = start;
+        scanParams.end = end;
+        scanParams.size = Value.size();
+        scanParams.flag = flags;
+        client->Send(&scanParams, sizeof(scanParams));
+        client->Send(Value.data(), Value.size());
 
-    // 进度回调循环
-    while (true) {
-      ScanProgress progress;
-      if (!client.Receive(&progress, sizeof(progress))) {
-        break;
-      }
+        // 进度回调循环
+        while (true) {
+          ScanProgress progress;
+          if (!client->Receive(&progress, sizeof(progress))) {
+            break;
+          }
 
-      if (callback) {
-        callback(progress.percent, progress.matchCount, progress.scannedBytes,
-                 progress.totalBytes, userData);
-      }
+          if (callback) {
+            callback(progress.percent, progress.matchCount,
+                     progress.scannedBytes, progress.totalBytes, userData);
+          }
 
-      if (progress.msgType == 2) { // 扫描完成
-        break;
-      } else if (progress.msgType == 3) { // 扫描出错
-        return false;
-      }
-    }
+          if (progress.msgType == 2) { // 扫描完成
+            break;
+          } else if (progress.msgType == 3) { // 扫描出错
+            return false;
+          }
+        }
 
-    if (!client.Receive(&len, sizeof(len)))
-      return false;
-    return true;
-  });
+        if (!client->Receive(&len, sizeof(len)))
+          return false;
+        return true;
+      });
 
   return success ? len : 0;
 }
 
 int ScanNextValueWithProgress(std::vector<unsigned char> &Value, int flag,
                               ScanProgressCallback callback, void *userData,
-                              uint64_t start, uint64_t end) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                              uint64_t start, uint64_t end, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return 0;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
@@ -592,60 +706,63 @@ int ScanNextValueWithProgress(std::vector<unsigned char> &Value, int flag,
 
   // 使用请求管理器保护整个扫描和进度接收过程
   int len = 0;
-  bool success = SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_SCANNEXTVALUE;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_SCANNEXTVALUE;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
 #pragma pack(1)
-    struct {
-      uint64_t start;
-      uint64_t end;
-      int size;
-      unsigned int flag;
-    } scanParams;
+        struct {
+          uint64_t start;
+          uint64_t end;
+          int size;
+          unsigned int flag;
+        } scanParams;
 #pragma pack()
 
-    scanParams.start = start;
-    scanParams.end = end;
-    scanParams.size = Value.size();
-    scanParams.flag = flag;
-    client.Send(&scanParams, sizeof(scanParams));
-    client.Send(Value.data(), Value.size());
+        scanParams.start = start;
+        scanParams.end = end;
+        scanParams.size = Value.size();
+        scanParams.flag = flag;
+        client->Send(&scanParams, sizeof(scanParams));
+        client->Send(Value.data(), Value.size());
 
-    // 进度回调循环
-    while (true) {
-      ScanProgress progress;
-      if (!client.Receive(&progress, sizeof(progress))) {
-        break;
-      }
+        // 进度回调循环
+        while (true) {
+          ScanProgress progress;
+          if (!client->Receive(&progress, sizeof(progress))) {
+            break;
+          }
 
-      if (callback) {
-        callback(progress.percent, progress.matchCount, progress.scannedBytes,
-                 progress.totalBytes, userData);
-      }
+          if (callback) {
+            callback(progress.percent, progress.matchCount,
+                     progress.scannedBytes, progress.totalBytes, userData);
+          }
 
-      if (progress.msgType == 2) { // 扫描完成
-        break;
-      } else if (progress.msgType == 3) { // 扫描出错
-        return false;
-      }
-    }
+          if (progress.msgType == 2) { // 扫描完成
+            break;
+          } else if (progress.msgType == 3) { // 扫描出错
+            return false;
+          }
+        }
 
-    if (!client.Receive(&len, sizeof(len)))
-      return false;
-    return true;
-  });
+        if (!client->Receive(&len, sizeof(len)))
+          return false;
+        return true;
+      });
 
   return success ? len : 0;
 }
 
 int ScanFuzzyValueWithProgress(uint32_t flags, ScanProgressCallback callback,
-                               void *userData, uint64_t start, uint64_t end) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                               void *userData, uint64_t start, uint64_t end,
+                               PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return 0;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
@@ -653,53 +770,54 @@ int ScanFuzzyValueWithProgress(uint32_t flags, ScanProgressCallback callback,
 
   // 使用请求管理器保护整个扫描和进度接收过程
   int len = 0;
-  bool success = SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_SCANFUZZYVALUE;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_SCANFUZZYVALUE;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
 #pragma pack(1)
-    struct {
-      uint64_t start;
-      uint64_t end;
-      unsigned int flag;
-    } scanParams;
+        struct {
+          uint64_t start;
+          uint64_t end;
+          unsigned int flag;
+        } scanParams;
 #pragma pack()
 
-    scanParams.start = start;
-    scanParams.end = end;
-    scanParams.flag = flags;
-    client.Send(&scanParams, sizeof(scanParams));
+        scanParams.start = start;
+        scanParams.end = end;
+        scanParams.flag = flags;
+        client->Send(&scanParams, sizeof(scanParams));
 
-    // 进度回调循环
-    while (true) {
-      ScanProgress progress;
-      if (!client.Receive(&progress, sizeof(progress))) {
-        break;
-      }
+        // 进度回调循环
+        while (true) {
+          ScanProgress progress;
+          if (!client->Receive(&progress, sizeof(progress))) {
+            break;
+          }
 
-      if (callback) {
-        callback(progress.percent, progress.matchCount, progress.scannedBytes,
-                 progress.totalBytes, userData);
-      }
+          if (callback) {
+            callback(progress.percent, progress.matchCount,
+                     progress.scannedBytes, progress.totalBytes, userData);
+          }
 
-      if (progress.msgType == 2) { // 扫描完成
-        break;
-      } else if (progress.msgType == 3) { // 扫描出错
-        return false;
-      }
-    }
+          if (progress.msgType == 2) { // 扫描完成
+            break;
+          } else if (progress.msgType == 3) { // 扫描出错
+            return false;
+          }
+        }
 
-    if (!client.Receive(&len, sizeof(len)))
-      return false;
-    return true;
-  });
+        if (!client->Receive(&len, sizeof(len)))
+          return false;
+        return true;
+      });
 
   return success ? len : 0;
 }
-
 
 /*
 500D;1f;6.0double;...
@@ -711,20 +829,21 @@ int ScanGroupValueWithProgress(
     std::vector<std::pair<std::vector<unsigned char>,
                           std::pair<char, char>> /*value,size,type*/> &Value,
     bool order /*是否按地址排序*/, ScanProgressCallback callback,
-    void *userData, uint64_t start, uint64_t end) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+    void *userData, uint64_t start, uint64_t end, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return 0;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return 0;
   int SearchCount = 0;
-  bool success =
-      SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
         unsigned char command = CMD_SCANGROUPVALUE;
-        if (!client.Send(&command, sizeof(command)))
+        if (!client->Send(&command, sizeof(command)))
           return false;
-        if (!client.Send(&handle, sizeof(handle)))
+        if (!client->Send(&handle, sizeof(handle)))
           return false;
 
 #pragma pack(1)
@@ -742,31 +861,31 @@ int ScanGroupValueWithProgress(
         scanParams.end = end;
         scanParams.order = order;
         scanParams.len = len;
-        client.Send(&scanParams, sizeof(scanParams));
+        client->Send(&scanParams, sizeof(scanParams));
 
         // 类型数组
         std::vector<char> types;
         for (auto &it : Value) {
           types.push_back(it.second.second);
         }
-        client.Send(types.data(), types.size());
+        client->Send(types.data(), types.size());
 
         // 数据大小数组
         std::vector<char> sizes;
         for (auto &it : Value) {
           sizes.push_back(it.second.first);
         }
-        client.Send(sizes.data(), sizes.size());
+        client->Send(sizes.data(), sizes.size());
 
         // 数据数组
         for (int i = 0; i < len; i++) {
-          client.Send(Value[i].first.data(), sizes[i]);
+          client->Send(Value[i].first.data(), sizes[i]);
         }
 
         // 进度回调循环
         while (true) {
           ScanProgress progress;
-          if (!client.Receive(&progress, sizeof(progress))) {
+          if (!client->Receive(&progress, sizeof(progress))) {
             break;
           }
 
@@ -782,7 +901,7 @@ int ScanGroupValueWithProgress(
           }
         }
 
-        if (!client.Receive(&SearchCount, sizeof(SearchCount)))
+        if (!client->Receive(&SearchCount, sizeof(SearchCount)))
           return false;
         return true;
       });
@@ -795,9 +914,10 @@ hex: 03 44 ? ? dd...
 */
 int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
                              std::vector<unsigned char> &Value,
-                             ScanProgressCallback callback,void *userData) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                             ScanProgressCallback callback, void *userData,
+                             PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return 0;
 
   int handle = 0;
@@ -807,12 +927,13 @@ int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
 
   // 使用请求管理器保护整个扫描和进度接收过程
   int len = 0;
-  bool success =
-      SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  bool success = SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
         unsigned char command = CMD_SCANHEX;
-        if (!client.Send(&command, sizeof(command)))
+        if (!client->Send(&command, sizeof(command)))
           return false;
-        if (!client.Send(&handle, sizeof(handle)))
+        if (!client->Send(&handle, sizeof(handle)))
           return false;
 
 #pragma pack(1)
@@ -826,13 +947,13 @@ int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
         scanParams.start = start;
         scanParams.end = end;
         scanParams.size = Value.size();
-        client.Send(&scanParams, sizeof(scanParams));
-        client.Send(Value.data(), Value.size());
+        client->Send(&scanParams, sizeof(scanParams));
+        client->Send(Value.data(), Value.size());
 
         // 进度回调循环
         while (true) {
           ScanProgress progress;
-          if (!client.Receive(&progress, sizeof(progress))) {
+          if (!client->Receive(&progress, sizeof(progress))) {
             break;
           }
 
@@ -848,7 +969,7 @@ int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
           }
         }
 
-        if (!client.Receive(&len, sizeof(len)))
+        if (!client->Receive(&len, sizeof(len)))
           return false;
         return true;
       });
@@ -856,270 +977,280 @@ int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
   return success ? len : 0;
 }
 
-
 /*
 获取有类型标志得结果，比如联合搜索，hex搜索
- std::vector<std::tuple<uint64_t, uint64_t, short>> results 
+ std::vector<std::tuple<uint64_t, uint64_t, short>> results
                          地址        值      类型标志
 */
 bool GetTypedScanResult(
     int offset, int count,
-    std::vector<std::tuple<uint64_t, uint64_t, short>> &results) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+    std::vector<std::tuple<uint64_t, uint64_t, short>> &results,
+    PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与ScanWindow自动刷新冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_GETSCAN_TYPE_RESULT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_GETSCAN_TYPE_RESULT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
-    CeGetScanResultInput input;
-    input.offset = offset;
-    input.count = count;
-    if (!client.Send(&input, sizeof(input)))
-      return false;
+        CeGetScanResultInput input;
+        input.offset = offset;
+        input.count = count;
+        if (!client->Send(&input, sizeof(input)))
+          return false;
 
-    CeGetScanResultOutput output;
-    if (!client.Receive(&output, sizeof(output)))
-      return false;
-    if (output.actual_count == 0)
-      return false;
+        CeGetScanResultOutput output;
+        if (!client->Receive(&output, sizeof(output)))
+          return false;
+        if (output.actual_count == 0)
+          return false;
 
+        for (int i = 0; i < output.actual_count; i++) {
+          uint64_t addr;
+          uint64_t value;
+          short type;
+          client->Receive(&addr, sizeof(addr));
+          client->Receive(&value, sizeof(value));
+          client->Receive(&type, sizeof(type));
+          results.push_back(std::make_tuple(addr, value, type));
+        }
 
-	for (int i = 0; i < output.actual_count; i++) {
-		uint64_t addr;
-		uint64_t value;
-		short type;
-		client.Receive(&addr, sizeof(addr));
-		client.Receive(&value, sizeof(value));
-		client.Receive(&type, sizeof(type));
-		results.push_back(std::make_tuple(addr, value, type));
-	}
-
-    return true;
-  });
+        return true;
+      });
 }
 
-
-
-
-
-
-
-
 bool ReadProcessMemoryBytes(uint64_t address, uint32_t size,
-                            std::vector<unsigned char> &out) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                            std::vector<unsigned char> &out, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与MemoryViewerWindow自动刷新冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
 #pragma pack(1)
-    struct {
-      unsigned char command;
-      CeReadProcessMemoryInput input;
-    } op;
+        struct {
+          unsigned char command;
+          CeReadProcessMemoryInput input;
+        } op;
 #pragma pack()
-    op.command = CMD_READPROCESSMEMORY;
-    op.input.handle = handle;
-    op.input.address = address;
-    op.input.size = size;
-    op.input.compress = 0;
-    if (!client.Send(&op, sizeof(op)))
-      return false;
+        op.command = CMD_READPROCESSMEMORY;
+        op.input.handle = handle;
+        op.input.address = address;
+        op.input.size = size;
+        op.input.compress = 0;
+        if (!client->Send(&op, sizeof(op)))
+          return false;
 
-    CeReadProcessMemoryOutput outHdr{};
-    if (!client.Receive(&outHdr, sizeof(outHdr)))
-      return false;
-    if (outHdr.read <= 0) {
-      out.clear();
-      return true;
-    }
-    out.resize(outHdr.read);
-    return client.Receive(out.data(), out.size());
-  });
+        CeReadProcessMemoryOutput outHdr{};
+        if (!client->Receive(&outHdr, sizeof(outHdr)))
+          return false;
+        if (outHdr.read <= 0) {
+          out.clear();
+          return true;
+        }
+        out.resize(outHdr.read);
+        return client->Receive(out.data(), out.size());
+      });
 }
 
 bool WriteProcessMemoryBytes(uint64_t address, uint32_t size,
-                             std::vector<unsigned char> &data) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                             std::vector<unsigned char> &data, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与其他窗口的写入操作冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
 #pragma pack(1)
-    struct {
-      unsigned char command;
-      CeWriteProcessMemoryInput input;
-    } op;
+        struct {
+          unsigned char command;
+          CeWriteProcessMemoryInput input;
+        } op;
 #pragma pack()
-    op.command = CMD_WRITEPROCESSMEMORY;
-    op.input.handle = handle;
-    op.input.address = address;
-    op.input.size = size;
-    if (!client.Send(&op, sizeof(op)))
-      return false;
-    client.Send(data.data(), data.size());
+        op.command = CMD_WRITEPROCESSMEMORY;
+        op.input.handle = handle;
+        op.input.address = address;
+        op.input.size = size;
+        if (!client->Send(&op, sizeof(op)))
+          return false;
+        client->Send(data.data(), data.size());
 
-    CeWriteProcessMemoryOutput output;
-    if (!client.Receive(&output, sizeof(output)))
-      return false;
-    return output.written == size;
-  });
+        CeWriteProcessMemoryOutput output;
+        if (!client->Receive(&output, sizeof(output)))
+          return false;
+        return output.written == size;
+      });
 }
 
 bool ReadProcessMemory_(uint64_t address, uint32_t size, void *out,
-                        int32_t &Realread) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+                        int32_t &Realread, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
 #pragma pack(1)
-    struct {
-      unsigned char command;
-      CeReadProcessMemoryInput input;
-    } op;
+        struct {
+          unsigned char command;
+          CeReadProcessMemoryInput input;
+        } op;
 #pragma pack()
-    op.command = CMD_READPROCESSMEMORY;
-    op.input.handle = handle;
-    op.input.address = address;
-    op.input.size = size;
-    op.input.compress = 0;
-    if (!client.Send(&op, sizeof(op)))
-      return false;
+        op.command = CMD_READPROCESSMEMORY;
+        op.input.handle = handle;
+        op.input.address = address;
+        op.input.size = size;
+        op.input.compress = 0;
+        if (!client->Send(&op, sizeof(op)))
+          return false;
 
-    client.Receive(&Realread, sizeof(Realread));
-    return client.Receive(out, size);
-  });
+        client->Receive(&Realread, sizeof(Realread));
+        return client->Receive(out, size);
+      });
 }
 
 bool ReadBratchMemory(
     uint64_t address, uint32_t size,
-    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> &out) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> &out,
+    PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
 #pragma pack(1)
-    struct {
-      unsigned char command;
-      int handle;
-      uint64_t address;
-      uint32_t size;
-    } op;
+        struct {
+          unsigned char command;
+          int handle;
+          uint64_t address;
+          uint32_t size;
+        } op;
 #pragma pack()
-    op.command = CMD_READBRATCHMEMORY;
-    op.handle = handle;
-    op.address = address;
-    op.size = size;
-    if (!client.Send(&op, sizeof(op)))
-      return false;
+        op.command = CMD_READBRATCHMEMORY;
+        op.handle = handle;
+        op.address = address;
+        op.size = size;
+        if (!client->Send(&op, sizeof(op)))
+          return false;
 
-    int len = 0;
-    if (!client.Receive(&len, sizeof(len)))
-      return false;
-    if (len <= 0) {
-      out.clear();
-      return true;
-    }
+        int len = 0;
+        if (!client->Receive(&len, sizeof(len)))
+          return false;
+        if (len <= 0) {
+          out.clear();
+          return true;
+        }
 
-    out.resize(len);
-    for (int i = 0; i < len; i++) {
-      uint64_t addr = 0;
-      std::vector<unsigned char> data;
-      data.resize(4096);
-      if (!client.Receive(&addr, sizeof(addr)))
-        return false;
-      if (!client.Receive(data.data(), 4096))
-        return false;
-      out[i] = {addr, data};
-    }
-    return true;
-  });
+        out.resize(len);
+        for (int i = 0; i < len; i++) {
+          uint64_t addr = 0;
+          std::vector<unsigned char> data;
+          data.resize(4096);
+          if (!client->Receive(&addr, sizeof(addr)))
+            return false;
+          if (!client->Receive(data.data(), 4096))
+            return false;
+          out[i] = {addr, data};
+        }
+        return true;
+      });
 }
 
 bool ReadBratchAddr(
     std::vector<std::pair<uint64_t, int32_t> /*addr,size*/> &addrs,
-    std::vector<std::pair<uint64_t, std::vector<uint8_t>> /*addr,data*/> &out) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>> /*addr,data*/> &out,
+    PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与ScanWindow自动刷新地址列表冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    // 发送命令
-    unsigned char command = CMD_READBRATCHADDR;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        // 发送命令
+        unsigned char command = CMD_READBRATCHADDR;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
-    // 发送地址列表
-    int len = addrs.size();
-    if (!client.Send(&len, sizeof(len)))
-      return false;
+        // 发送地址列表
+        int len = addrs.size();
+        if (!client->Send(&len, sizeof(len)))
+          return false;
 
-    std::vector<CeReadBratchAddr> input(len);
-    for (int i = 0; i < len; i++) {
-      input[i].addr = addrs[i].first;
-      input[i].size = addrs[i].second;
-    }
-    if (!client.Send(input.data(), len * sizeof(CeReadBratchAddr)))
-      return false;
+        std::vector<CeReadBratchAddr> input(len);
+        for (int i = 0; i < len; i++) {
+          input[i].addr = addrs[i].first;
+          input[i].size = addrs[i].second;
+        }
+        if (!client->Send(input.data(), len * sizeof(CeReadBratchAddr)))
+          return false;
 
-    // 接收数据
-    out.clear();
-    out.resize(len);
-    int result = 0;
-    if (!client.Receive(&result, sizeof(result)))
-      return false;
+        // 接收数据
+        out.clear();
+        out.resize(len);
+        int result = 0;
+        if (!client->Receive(&result, sizeof(result)))
+          return false;
 
-    for (int i = 0; i < len; i++) {
-      uint64_t addr = 0;
-      int32_t size = input[i].size;
-      std::vector<unsigned char> data(size);
-      if (!client.Receive(&addr, sizeof(addr)))
-        return false;
+        for (int i = 0; i < len; i++) {
+          uint64_t addr = 0;
+          int32_t size = input[i].size;
+          std::vector<unsigned char> data(size);
+          if (!client->Receive(&addr, sizeof(addr)))
+            return false;
 
-      if (!client.Receive(data.data(), size))
-        return false;
-      out[i] = {addr, data};
-    }
-    return true;
-  });
+          if (!client->Receive(data.data(), size))
+            return false;
+          out[i] = {addr, data};
+        }
+        return true;
+      });
 }
 
-bool GetModuleBaseByName(const std::string &moduleName, uint64_t &outBase) {
+bool GetModuleBaseByName(const std::string &moduleName, uint64_t &outBase,
+                         PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
+    return false;
   std::vector<ModuleInfoItem> mods;
-  if (!FetchModuleList(mods))
+  if (!FetchModuleList(mods, port))
     return false;
   for (const auto &m : mods) {
     if (_stricmp(m.name.c_str(), moduleName.c_str()) == 0) {
@@ -1147,9 +1278,9 @@ bool ResolveModuleOffsetChain(uint64_t &outAddress,
                               const std::string &moduleName,
                               uint64_t baseOffset,
                               const std::vector<uint64_t> &offsets,
-                              bool derefFinal) {
+                              bool derefFinal, PortType port) {
   uint64_t base = 0;
-  if (!GetModuleBaseByName(moduleName, base))
+  if (!GetModuleBaseByName(moduleName, base, port))
     return false;
   uint64_t addr = base + baseOffset;
   if (offsets.empty()) {
@@ -1173,154 +1304,165 @@ bool ResolveModuleOffsetChain(uint64_t &outAddress,
 }
 
 //=================内核断点相关=================
-bool SetKernelBreakpoint(uint64_t address, uint32_t bpType, uint32_t bpSize) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool SetKernelBreakpoint(uint64_t address, uint32_t bpType, uint32_t bpSize,
+                         PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与BreakpointWindow操作冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_KERNEL_SETBREAKPOINT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_KERNEL_SETBREAKPOINT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
 
-    if (!client.Send(&address, sizeof(address)))
-      return false;
-    if (!client.Send(&bpType, sizeof(bpType)))
-      return false;
-    if (!client.Send(&bpSize, sizeof(bpSize)))
-      return false;
+        if (!client->Send(&address, sizeof(address)))
+          return false;
+        if (!client->Send(&bpType, sizeof(bpType)))
+          return false;
+        if (!client->Send(&bpSize, sizeof(bpSize)))
+          return false;
 
-    int result = 0;
-    if (!client.Receive(&result, sizeof(result)))
-      return false;
-    if (result == 0)
-      return false;
+        int result = 0;
+        if (!client->Receive(&result, sizeof(result)))
+          return false;
+        if (result == 0)
+          return false;
 
-    return true;
-  });
+        return true;
+      });
 }
 
-bool RemoveKernelBreakpoint(uint64_t address) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool RemoveKernelBreakpoint(uint64_t address, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与BreakpointWindow操作冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_KERNEL_REMOVEBREAKPOINT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
-    if (!client.Send(&address, sizeof(address)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_KERNEL_REMOVEBREAKPOINT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+        if (!client->Send(&address, sizeof(address)))
+          return false;
 
-    int result = 0;
-    if (!client.Receive(&result, sizeof(result)))
-      return false;
-    if (result == 0)
-      return false;
+        int result = 0;
+        if (!client->Receive(&result, sizeof(result)))
+          return false;
+        if (result == 0)
+          return false;
 
-    return true;
-  });
+        return true;
+      });
 }
 
-bool SuspendKernelBreakpoint(uint64_t address) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool SuspendKernelBreakpoint(uint64_t address, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与BreakpointWindow操作冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_KERNEL_SUSPENDBREAKPOINT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
-    if (!client.Send(&address, sizeof(address)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_KERNEL_SUSPENDBREAKPOINT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+        if (!client->Send(&address, sizeof(address)))
+          return false;
 
-    int result = 0;
-    if (!client.Receive(&result, sizeof(result)))
-      return false;
-    if (result == 0)
-      return false;
+        int result = 0;
+        if (!client->Receive(&result, sizeof(result)))
+          return false;
+        if (result == 0)
+          return false;
 
-    return true;
-  });
+        return true;
+      });
 }
 
-bool ResumeKernelBreakpoint(uint64_t address) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool ResumeKernelBreakpoint(uint64_t address, PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与BreakpointWindow操作冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_KERNEL_RESUMEBREAKPOINT;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
-    if (!client.Send(&address, sizeof(address)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_KERNEL_RESUMEBREAKPOINT;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+        if (!client->Send(&address, sizeof(address)))
+          return false;
 
-    int result = 0;
-    if (!client.Receive(&result, sizeof(result)))
-      return false;
-    if (result == 0)
-      return false;
+        int result = 0;
+        if (!client->Receive(&result, sizeof(result)))
+          return false;
+        if (result == 0)
+          return false;
 
-    return true;
-  });
+        return true;
+      });
 }
 
-bool ReadKernelBreakpointInfo(uint64_t address,
-                              std::vector<HW_HIT_INFO> &infos) {
-  WindowsSocketClient &client = GetSocketClient();
-  if (!client.IsConnected())
+bool ReadKernelBreakpointInfo(uint64_t address, std::vector<HW_HIT_INFO> &infos,
+                              PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
     return false;
   int handle = 0;
   if (!EnsureOpenHandle(handle))
     return false;
 
   // 使用请求管理器保护Socket操作，防止与BreakpointWindow自动刷新冲突
-  return SocketRequestManager::GetInstance().ExecuteRequest([&]() -> bool {
-    unsigned char command = CMD_KERNEL_READHWBPINFO;
-    if (!client.Send(&command, sizeof(command)))
-      return false;
-    if (!client.Send(&handle, sizeof(handle)))
-      return false;
-    if (!client.Send(&address, sizeof(address)))
-      return false;
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_KERNEL_READHWBPINFO;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+        if (!client->Send(&address, sizeof(address)))
+          return false;
 
-    int result = 0;
-    uint64_t TotalCount = 0;
-    if (!client.Receive(&result, sizeof(result)))
-      return false;
-    if (!client.Receive(&TotalCount, sizeof(TotalCount)))
-      return false;
+        int result = 0;
+        uint64_t TotalCount = 0;
+        if (!client->Receive(&result, sizeof(result)))
+          return false;
+        if (!client->Receive(&TotalCount, sizeof(TotalCount)))
+          return false;
 
-    if (result > 0) {
-      infos.resize(result);
-      if (!client.Receive(infos.data(), result * sizeof(HW_HIT_INFO)))
-        return false;
-    }
-    return true;
-  });
+        if (result > 0) {
+          infos.resize(result);
+          if (!client->Receive(infos.data(), result * sizeof(HW_HIT_INFO)))
+            return false;
+        }
+        return true;
+      });
 }

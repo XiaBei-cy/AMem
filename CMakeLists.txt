@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
-project(ImGuiProject)
+
+# ==================== 项目版本定义 ====================
+set(PROJECT_VERSION_MAJOR 1)
+set(PROJECT_VERSION_MINOR 0)
+set(PROJECT_VERSION_PATCH 0)
+set(PROJECT_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}")
+
+# 协议版本（与服务端协商使用）
+set(PROTOCOL_VERSION_MAJOR 1)
+set(PROTOCOL_VERSION_MINOR 1)
+set(PROTOCOL_VERSION_PATCH 0)
+set(PROTOCOL_VERSION "${PROTOCOL_VERSION_MAJOR}.${PROTOCOL_VERSION_MINOR}.${PROTOCOL_VERSION_PATCH}")
+
+project(ImGuiProject VERSION ${PROJECT_VERSION})
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -9,6 +22,49 @@ option(USE_DX12 "Use DirectX 12 backend" ON)
 #option(USE_VULKAN "Use Vulkan backend" OFF)
 
 message(STATUS "CMAKE_SOURCE_DIR: ${CMAKE_SOURCE_DIR}")
+
+# ==================== 生成版本信息头文件 ====================
+# 获取当前日期和时间
+string(TIMESTAMP BUILD_DATE "%Y-%m-%d")
+string(TIMESTAMP BUILD_TIME "%H:%M:%S")
+
+# 尝试获取 Git 信息（可选）
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_BRANCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+else()
+    set(GIT_COMMIT_HASH "unknown")
+    set(GIT_BRANCH "unknown")
+endif()
+
+# 配置版本头文件
+configure_file(
+    ${CMAKE_SOURCE_DIR}/version.h.in
+    ${CMAKE_BINARY_DIR}/generated/version.h
+    @ONLY
+)
+
+# 添加生成的头文件目录到包含路径
+include_directories(${CMAKE_BINARY_DIR}/generated)
+
+message(STATUS "Project Version: ${PROJECT_VERSION}")
+message(STATUS "Protocol Version: ${PROTOCOL_VERSION}")
+message(STATUS "Build Date: ${BUILD_DATE} ${BUILD_TIME}")
+message(STATUS "Git Commit: ${GIT_COMMIT_HASH}")
+message(STATUS "Git Branch: ${GIT_BRANCH}")
 
 
 #设置输出目录
