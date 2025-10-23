@@ -45,6 +45,9 @@
 - ✅ 实时进度显示
 - ✅ 结果过滤和导出
 
+  <img width="964" height="619" alt="搜索" src="https://github.com/user-attachments/assets/e569c833-1444-43f6-9937-87c557466abe" />
+
+
 ### 2. 指针链扫描 (PointerChainWindow)
 - ✅ 自动查找指向目标地址的指针链
 - ✅ 可配置扫描参数：
@@ -56,24 +59,33 @@
 - ✅ 实时进度监控
 - ✅ 指针链可视化显示
 - ✅ 指针链树形编辑器（开发中）
+<img width="1145" height="649" alt="指针扫描" src="https://github.com/user-attachments/assets/06e748d9-24c7-4eee-8b7c-395996552f5f" />
+
 
 ### 3. 内存查看器 (MemoryViewerWindow)
 - ✅ 十六进制内存查看
 - ✅ 内存编辑功能
 - ✅ 支持跳转到指定地址
 - ✅ 多种数据类型解析
+<img width="1032" height="568" alt="内存查看" src="https://github.com/user-attachments/assets/a4e09eea-8745-4f32-9c93-3ee02e067185" />
+
 
 ### 4. 断点调试 (BreakpointWindow)
 - ✅ 硬件断点（读/写/执行）
 - ✅ 断点命中信息查看
 - ✅ 断点暂停/恢复
 - ✅ 反汇编显示（需要 Capstone）
+<img width="967" height="603" alt="断点" src="https://github.com/user-attachments/assets/7fd1fe99-966b-4094-9cc5-87a6a5900c23" />
+<img width="975" height="645" alt="反汇编" src="https://github.com/user-attachments/assets/5fd54c8b-9087-4246-b34e-e44c772b3aa8" />
+
 
 ### 5. 进程管理
 - ✅ 进程列表查看
 - ✅ 模块列表查看
 - ✅ 进程附加/分离
 - ✅ 模块基址查询
+<img width="1111" height="705" alt="模块列表" src="https://github.com/user-attachments/assets/16e59225-3453-48a0-873b-4e8c48ccc4a2" />
+
 
 ### 6. 异常处理
 - ✅ SEH 异常捕获
