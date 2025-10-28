@@ -5,7 +5,7 @@
 
 [视频效果](https://www.bilibili.com/video/BV1KpWbzeEFU/)
 
-[TG频道](https://t.me/androidmem)
+[TG频道 内存库文件获取](https://t.me/androidmem)
 
 
 # Android Cheat Engine (ImGui版)
