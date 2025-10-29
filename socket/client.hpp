@@ -59,6 +59,12 @@
 
 #define CMD_READBRATCHADDR 228
 
+#define CMD_SHELLEXEC 227
+
+#define CMD_STOPPROCESS 226 //用于其他线程发送停止命令
+
+
+
 #pragma pack(1)
 struct CeVersion {
     int version;

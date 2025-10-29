@@ -215,3 +215,6 @@ bool SuspendKernelBreakpoint(uint64_t address, PortType type = PORT_MAIN);
 bool ResumeKernelBreakpoint(uint64_t address, PortType type = PORT_MAIN);
 bool ReadKernelBreakpointInfo(uint64_t address, std::vector<HW_HIT_INFO> &infos,
                               PortType type = PORT_MAIN);
+
+// 停止扫描
+bool StopSearchScan(PortType type = PORT_DEBUG);

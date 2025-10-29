@@ -231,7 +231,12 @@ void ScanWindow::drawScanProgressBar()
         ImGui::Spacing();
         if (ImGui::Button("取消扫描", ImVec2(-1, 0))) {
             scanCancelled = true;
-            Gui::log("用户取消了扫描");
+            // 使用 PORT_DEBUG 端口发送取消命令到服务端
+            if (StopSearchScan(PORT_DEBUG)) {
+                Gui::log("用户取消了扫描，已发送停止命令到服务端");
+            } else {
+                Gui::log("用户取消了扫描，但发送停止命令失败（将等待本地线程结束）");
+            }
         }
     } else if (scanCompleted) {
         // 显示扫描完成状态

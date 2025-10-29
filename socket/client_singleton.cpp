@@ -674,7 +674,7 @@ int ScanValueWithProgress(uint32_t flags, std::vector<unsigned char> &Value,
           if (progress.msgType == 2) { // 扫描完成
             break;
           } else if (progress.msgType == 3) { // 扫描出错
-            return false;
+            break;
           }
         }
 
@@ -738,7 +738,7 @@ int ScanNextValueWithProgress(std::vector<unsigned char> &Value, int flag,
           if (progress.msgType == 2) { // 扫描完成
             break;
           } else if (progress.msgType == 3) { // 扫描出错
-            return false;
+            break;
           }
         }
 
@@ -798,8 +798,8 @@ int ScanFuzzyValueWithProgress(uint32_t flags, ScanProgressCallback callback,
 
           if (progress.msgType == 2) { // 扫描完成
             break;
-          } else if (progress.msgType == 3) { // 扫描出错
-            return false;
+          } else if (progress.msgType == 3) { // 扫描取消
+            break;
           }
         }
 
@@ -889,7 +889,7 @@ int ScanGroupValueWithProgress(
           if (progress.msgType == 2) { // 扫描完成
             break;
           } else if (progress.msgType == 3) { // 扫描出错
-            return false;
+            break;
           }
         }
 
@@ -957,7 +957,7 @@ int ScanHEXValueWithProgress(uint64_t start, uint64_t end,
           if (progress.msgType == 2) { // 扫描完成
             break;
           } else if (progress.msgType == 3) { // 扫描出错
-            return false;
+            break;
           }
         }
 
@@ -1455,6 +1455,33 @@ bool ReadKernelBreakpointInfo(uint64_t address, std::vector<HW_HIT_INFO> &infos,
           if (!client->Receive(infos.data(), result * sizeof(HW_HIT_INFO)))
             return false;
         }
+        return true;
+      });
+}
+
+
+bool StopSearchScan(PortType port) {
+  auto client = GetSocketMgr().GetClient(port);
+  if (!client->IsConnected())
+    return false;
+  int handle = 0;
+  if (!EnsureOpenHandle(handle))
+    return false;
+
+  auto portMutex = GetSocketMgr().GetMutex(port);
+  return SocketRequestManager::GetInstance().ExecuteRequestWithLock(
+      portMutex, [&]() -> bool {
+        unsigned char command = CMD_STOPPROCESS;
+        if (!client->Send(&command, sizeof(command)))
+          return false;
+        if (!client->Send(&handle, sizeof(handle)))
+          return false;
+
+        int result = 0;
+        if (!client->Receive(&result, sizeof(result)))
+          return false;   
+        if (result == 0)
+          return false;
         return true;
       });
 }
