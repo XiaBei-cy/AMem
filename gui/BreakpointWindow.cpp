@@ -455,7 +455,8 @@ void BreakpointWindow::refreshBreakpointHitInfo(int index)
     }
     
     std::vector<HW_HIT_INFO> hitInfos;
-    if (ReadKernelBreakpointInfo(bp.address, hitInfos)) {
+    // 使用调试端口进行自动刷新，避免阻塞主端口
+    if (ReadKernelBreakpointInfo(bp.address, hitInfos, PORT_DEBUG)) {
         int newCount = (int)hitInfos.size();
         
         // 如果没有新数据，直接返回
@@ -1591,9 +1592,9 @@ void BreakpointWindow::drawDisassemblyForPC(uint64_t pcAddress, int beforeCount,
     
     // 如果需要刷新或缓存无效，重新读取和反汇编
     if (!cacheValid || shouldAutoRefresh) {
-        // 从远程进程读取内存
+        // 从远程进程读取内存（使用调试端口进行自动刷新）
         std::vector<unsigned char> memoryData;
-        bool readSuccess = ReadProcessMemoryBytes(startAddress, totalSize, memoryData);
+        bool readSuccess = ReadProcessMemoryBytes(startAddress, totalSize, memoryData, PORT_DEBUG);
         
         if (!readSuccess || memoryData.empty()) {
             // 读取失败，但如果有缓存，继续使用缓存

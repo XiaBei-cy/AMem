@@ -94,7 +94,8 @@ void MemoryViewerWindow::refreshMemory()
         // 确保buffer大小正确
         buffer.resize(viewSize);
         
-        if (!ReadProcessMemoryBytes(viewAddress, (uint32_t)viewSize, buffer)) {
+        // 使用调试端口进行自动刷新，避免阻塞主端口
+        if (!ReadProcessMemoryBytes(viewAddress, (uint32_t)viewSize, buffer, PORT_DEBUG)) {
             // 读取失败时，清空buffer避免显示错误数据
             std::fill(buffer.begin(), buffer.end(), 0);
             Gui::log("刷新内存失败: 0x%llX", viewAddress);

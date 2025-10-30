@@ -1830,9 +1830,9 @@ void ScanWindow::refreshAddressValues()
         batchAddrs.push_back({data.address, size});
     }
     
-    // 批量读取所有地址
+    // 批量读取所有地址（使用调试端口进行自动刷新）
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> batchResults;
-    bool batchSuccess = ReadBratchAddr(batchAddrs, batchResults);
+    bool batchSuccess = ReadBratchAddr(batchAddrs, batchResults, PORT_DEBUG);
     
     if (batchSuccess && batchResults.size() == refreshData.size()) {
         // 批量读取成功，解析结果
@@ -1865,7 +1865,7 @@ void ScanWindow::refreshAddressValues()
                 default: size = 4; break;
             }
             
-            if (ReadProcessMemoryBytes(data.address, size, buffer) && buffer.size() >= size) {
+            if (ReadProcessMemoryBytes(data.address, size, buffer, PORT_DEBUG) && buffer.size() >= size) {
                 data.newValue = formatValueOutput(buffer.data(), data.valueType);
                 data.success = true;
             } else {
@@ -1943,7 +1943,7 @@ void ScanWindow::refreshSingleAddress(int index)
         default: size = 4; break;
     }
     
-    if (ReadProcessMemoryBytes(item.address, size, buffer) && buffer.size() >= size) {
+    if (ReadProcessMemoryBytes(item.address, size, buffer, PORT_DEBUG) && buffer.size() >= size) {
         item.currentValue = formatValueOutput(buffer.data(), item.valueType);
     } else {
         item.currentValue = "读取失败";
@@ -2017,9 +2017,9 @@ void ScanWindow::refreshScanResultsValues()
         batchAddrs.push_back({r.address, size});
     }
     
-    // 批量读取所有地址
+    // 批量读取所有地址（使用调试端口进行自动刷新）
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> batchResults;
-    bool batchSuccess = ReadBratchAddr(batchAddrs, batchResults);
+    bool batchSuccess = ReadBratchAddr(batchAddrs, batchResults, PORT_DEBUG);
     
     if (batchSuccess && batchResults.size() == results.size()) {
         // 批量读取成功，解析结果
@@ -2042,10 +2042,10 @@ void ScanWindow::refreshScanResultsValues()
             refreshProgress++;
         }
     } else {
-        // 批量读取失败，回退到逐个读取
+        // 批量读取失败，回退到逐个读取（使用调试端口）
         for (auto& r : results) {
             std::vector<unsigned char> buffer;
-            if (ReadProcessMemoryBytes(r.address, size, buffer) && buffer.size() >= size) {
+            if (ReadProcessMemoryBytes(r.address, size, buffer, PORT_DEBUG) && buffer.size() >= size) {
                 uint64_t newValue = 0;
                 memcpy(&newValue, buffer.data(), size);
                 r.newValue = newValue;
