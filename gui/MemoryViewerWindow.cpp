@@ -10,6 +10,62 @@
 #include <fstream>
 #include <cmath>
 
+// 解析地址表达式，支持十六进制加减运算
+// 例如: "1000", "1000+200", "5000-100", "ABCD + 10"
+static bool parseAddressExpression(const char* expr, uint64_t& result)
+{
+    if (!expr || expr[0] == '\0') return false;
+    
+    std::string s = expr;
+    // 去除所有空格
+    s.erase(std::remove(s.begin(), s.end(), ' '), s.end());
+    
+    if (s.empty()) return false;
+    
+    // 查找+或-运算符（从索引1开始，避免将负号误认为运算符）
+    size_t opPos = std::string::npos;
+    char op = '\0';
+    
+    // 从后向前查找最后一个+或-（支持多次运算，从右向左计算）
+    for (size_t i = s.length() - 1; i > 0; i--) {
+        if (s[i] == '+' || s[i] == '-') {
+            opPos = i;
+            op = s[i];
+            break;
+        }
+    }
+    
+    if (opPos == std::string::npos) {
+        // 没有运算符，直接解析十六进制数
+        char* endPtr = nullptr;
+        result = strtoull(s.c_str(), &endPtr, 16);
+        return endPtr != s.c_str() && *endPtr == '\0';
+    }
+    
+    // 有运算符，递归解析左右两边
+    std::string leftStr = s.substr(0, opPos);
+    std::string rightStr = s.substr(opPos + 1);
+    
+    uint64_t left = 0, right = 0;
+    
+    // 递归解析左边（支持嵌套表达式）
+    if (!parseAddressExpression(leftStr.c_str(), left)) return false;
+    
+    // 解析右边
+    char* endPtr = nullptr;
+    right = strtoull(rightStr.c_str(), &endPtr, 16);
+    if (endPtr == rightStr.c_str() || *endPtr != '\0') return false;
+    
+    // 计算结果
+    if (op == '+') {
+        result = left + right;
+    } else if (op == '-') {
+        result = left - right;
+    }
+    
+    return true;
+}
+
 MemoryViewerWindow::MemoryViewerWindow()
 {
     name = "内存查看器";
@@ -231,22 +287,45 @@ void MemoryViewerWindow::drawMemoryViewerPanel()
     ImGui::Separator();
     ImGui::SameLine();
     
-    // 地址输入
+    // 地址输入 - 支持表达式计算
     ImGui::Text("地址:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(160);
-    static uint64_t inputAddress = 0;
-    if (viewAddress != inputAddress) {
-        inputAddress = viewAddress;
+    ImGui::SetNextItemWidth(200);
+    
+    // 使用targetAddress作为显示地址（目标地址而不是页首）
+    static char addressInputBuf[64] = "";
+    static uint64_t lastTargetAddress = 0;
+    
+    // 当目标地址改变时，更新输入框显示
+    if (targetAddress != lastTargetAddress) {
+        snprintf(addressInputBuf, sizeof(addressInputBuf), "%llX", targetAddress);
+        lastTargetAddress = targetAddress;
     }
-    ImGui::InputScalar("##addr", ImGuiDataType_U64, &inputAddress, nullptr, nullptr, "%llX", ImGuiInputTextFlags_CharsHexadecimal);
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        jumpToAddress(inputAddress);
+    
+    if (ImGui::InputText("##addr", addressInputBuf, sizeof(addressInputBuf), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        // 解析地址表达式
+        uint64_t newAddress = 0;
+        if (parseAddressExpression(addressInputBuf, newAddress)) {
+            jumpToAddress(newAddress);
+            // 更新输入框显示为计算后的地址
+            snprintf(addressInputBuf, sizeof(addressInputBuf), "%llX", newAddress);
+        } else {
+            Gui::log("无效的地址表达式: %s", addressInputBuf);
+            // 恢复为上次有效的地址
+            snprintf(addressInputBuf, sizeof(addressInputBuf), "%llX", targetAddress);
+        }
+    }
+    
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("支持十六进制运算\n例如: 1000+200, 5000-100\n按回车确认");
     }
     
     ImGui::SameLine();
     if (ImGui::Button("读取")) {
-        jumpToAddress(inputAddress);
+        uint64_t addr = 0;
+        if (parseAddressExpression(addressInputBuf, addr)) {
+            jumpToAddress(addr);
+        }
     }
     
     ImGui::SameLine();
@@ -2566,6 +2645,68 @@ void MemoryViewerWindow::drawMemoryHexEditor()
             ImGui::TableSetupColumn("文本", ImGuiTableColumnFlags_WidthFixed, 200.0f);
         }
         ImGui::TableHeadersRow();
+        
+        // 检测滚动位置，实现连续滚动
+        float scrollY = ImGui::GetScrollY();
+        float scrollMaxY = ImGui::GetScrollMaxY();
+        static bool isAutoScrolling = false;
+        
+        // 滚动到底部 - 自动加载下一页
+        if (scrollY >= scrollMaxY - 10.0f && scrollMaxY > 0 && !isAutoScrolling) {
+            isAutoScrolling = true;
+            
+            // 扩展buffer，读取下一页数据
+            size_t currentSize = buffer.size();
+            size_t newSize = currentSize + pageSize;
+            
+            // 限制最大缓冲区大小（例如最多10页）
+            if (newSize <= pageSize * 10) {
+                buffer.resize(newSize);
+                
+                // 读取下一页数据
+                uint64_t nextPageAddr = viewAddress + currentSize;
+                std::vector<unsigned char> nextPageData;
+                if (ReadProcessMemoryBytes(nextPageAddr, pageSize, nextPageData, PORT_DEBUG)) {
+                    // 复制数据到buffer末尾
+                    std::copy(nextPageData.begin(), nextPageData.end(), buffer.begin() + currentSize);
+                    viewSize = newSize;
+                    Gui::log("已加载下一页: 0x%llX", nextPageAddr);
+                } else {
+                    // 读取失败，恢复buffer大小
+                    buffer.resize(currentSize);
+                }
+            }
+            
+            isAutoScrolling = false;
+        }
+        
+        // 滚动到顶部 - 自动加载上一页
+        if (scrollY <= 10.0f && viewAddress >= pageSize && !isAutoScrolling) {
+            isAutoScrolling = true;
+            
+            // 在buffer前面插入数据
+            uint64_t prevPageAddr = viewAddress - pageSize;
+            std::vector<unsigned char> prevPageData;
+            
+            // 限制最大缓冲区大小
+            if (buffer.size() < pageSize * 10) {
+                if (ReadProcessMemoryBytes(prevPageAddr, pageSize, prevPageData, PORT_DEBUG)) {
+                    // 在buffer前面插入数据
+                    buffer.insert(buffer.begin(), prevPageData.begin(), prevPageData.end());
+                    viewAddress = prevPageAddr;
+                    viewSize = buffer.size();
+                    
+                    // 保持滚动位置（调整scroll以保持视觉连续性）
+                    float rowHeight = ImGui::GetTextLineHeightWithSpacing();
+                    int rowsPerPage = pageSize / bytesPerRow;
+                    ImGui::SetScrollY(scrollY + rowsPerPage * rowHeight);
+                    
+                    Gui::log("已加载上一页: 0x%llX", prevPageAddr);
+                }
+            }
+            
+            isAutoScrolling = false;
+        }
         
         // 在ASCII列标题下方添加文本模式切换
         if (showAscii) {
