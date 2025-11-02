@@ -52,15 +52,16 @@ namespace Gui {
 			bootstrapped = true;
 		}
 
-		for (auto it = windows.begin(); it != windows.end(); )
+		for (auto it = windows.begin(); it != windows.end(); ++it)
 		{
 			Window* w = it->get();
-			if (!w || !w->pOpen) {
-				it = windows.erase(it);
+			if (!w) {
 				continue;
 			}
-			(*w)();
-			++it;
+			// 只绘制打开的窗口，但不删除关闭的窗口（保留状态和指针有效性）
+			if (w->pOpen) {
+				(*w)();
+			}
 		}
 
 		drawLogsPanel();
