@@ -139,7 +139,7 @@ void ServerConnectWindow::drawDriverControls() {
   ImGui::InputText("卡密", cardKeyBuf, IM_ARRAYSIZE(cardKeyBuf));
   // 列表显示5 6
   const char *kernelVersionList[] = {"5系", "6系"};
-  int currentKernelVersion = 1;
+  int currentKernelVersion = (KernelVersionBuf == '5') ? 0 : 1;
   ImGui::PushItemWidth(100);
   if (ImGui::Combo("##kernelVersion", &currentKernelVersion, kernelVersionList,
                    IM_ARRAYSIZE(kernelVersionList))) {
