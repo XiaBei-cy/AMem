@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Window.h"
+#include "ConfigManager.h"
 #include <string>
 #include <functional>
 
@@ -33,4 +34,8 @@ private:
 	void updateStatus(bool ok, const char* action);
 	void updateMemType();
 	void initializeDriver();
+	
+	// 配置相关方法
+	void loadConfig();
+	void saveConfig();
 }; 

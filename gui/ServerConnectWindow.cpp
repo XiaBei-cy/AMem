@@ -4,6 +4,7 @@
 #include "../socket/client.hpp"
 #include "Gui.h"
 #include "version.h"
+#include "ConfigManager.h"
 
 ServerConnectWindow::ServerConnectWindow()
 {
@@ -23,6 +24,9 @@ ServerConnectWindow::ServerConnectWindow()
 	memTypeNames[2] = "系统调用";
 	memTypeNames[3] = "内核";
 	memTypeNames[4] = "系统钩子";
+	
+	// 加载配置
+	loadConfig();
 	
 	updateMemType();
 }
@@ -136,16 +140,26 @@ void ServerConnectWindow::drawDriverControls() {
   }
 
   // 卡密输入和驱动初始化
-  ImGui::InputText("卡密", cardKeyBuf, IM_ARRAYSIZE(cardKeyBuf));
+  bool cardKeyChanged = false;
+  if (ImGui::InputText("卡密", cardKeyBuf, IM_ARRAYSIZE(cardKeyBuf))) {
+    cardKeyChanged = true;
+  }
   // 列表显示5 6
   const char *kernelVersionList[] = {"5系", "6系"};
   int currentKernelVersion = (KernelVersionBuf == '5') ? 0 : 1;
   ImGui::PushItemWidth(100);
+  bool kernelVersionChanged = false;
   if (ImGui::Combo("##kernelVersion", &currentKernelVersion, kernelVersionList,
                    IM_ARRAYSIZE(kernelVersionList))) {
     KernelVersionBuf = currentKernelVersion == 0 ? '5' : '6';
+    kernelVersionChanged = true;
   }
   ImGui::PopItemWidth();
+  
+  // 如果配置改变，保存配置
+  if (cardKeyChanged || kernelVersionChanged) {
+    saveConfig();
+  }
 
   auto client = GetSocketMgr().GetClient(PORT_MAIN);
   if (client->IsConnected()) {
@@ -161,6 +175,39 @@ void ServerConnectWindow::drawDriverControls() {
   }
 
   ImGui::Text("驱动状态: %s", driverStatus.c_str());
+}
+
+void ServerConnectWindow::loadConfig()
+{
+	auto& config = ConfigManager::getInstance();
+	config.loadConfig("config.ini");
+	
+	// 加载卡密
+	std::string cardKey = config.getString("cardKey", "1142192691366763");
+	std::snprintf(cardKeyBuf, sizeof(cardKeyBuf), "%s", cardKey.c_str());
+	
+	// 加载内核版本
+	KernelVersionBuf = config.getChar("kernelVersion", '6');
+	
+	Gui::log("配置已加载: 卡密=%s, 内核版本=%c", cardKeyBuf, KernelVersionBuf);
+}
+
+void ServerConnectWindow::saveConfig()
+{
+	auto& config = ConfigManager::getInstance();
+	
+	// 保存卡密
+	config.setString("cardKey", std::string(cardKeyBuf));
+	
+	// 保存内核版本
+	config.setChar("kernelVersion", KernelVersionBuf);
+	
+	// 保存到文件
+	if (config.saveConfig("config.ini")) {
+		Gui::log("配置已保存: 卡密=%s, 内核版本=%c", cardKeyBuf, KernelVersionBuf);
+	} else {
+		Gui::log("配置保存失败");
+	}
 }
 
 void ServerConnectWindow::onDraw()

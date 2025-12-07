@@ -158,6 +158,7 @@ set(GUI_SOURCES
     gui/VersionWindow.cpp
     gui/PointerChainWindow.cpp
     gui/DisassemblyHelper.cpp
+    gui/ConfigManager.cpp
 )
 
 set(SOCKET_SOURCES
@@ -189,6 +190,9 @@ add_executable(ImGuiProject
     ${POINTERSCAN_SOURCES}
 )
 
+# add_executable(TEST
+#     test.cpp
+# )
 # 链接 Windows 系统库
 if (USE_DX11)
     target_link_libraries(ImGuiProject d3d11 dxgi d3dcompiler)
