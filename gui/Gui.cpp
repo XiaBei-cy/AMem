@@ -6,6 +6,10 @@
 #include "../imgui/imgui.h"
 #include <map>
 
+#ifdef HAVE_LUAJIT
+#include "LuaScriptWindow.h"
+#endif
+
 namespace Gui {
 	std::list<std::unique_ptr<Window>> windows;
 	std::list<std::pair<std::string, int>> logs;
@@ -47,6 +51,9 @@ namespace Gui {
 				Gui::addWindow(new CEWindow());
 				Gui::addWindow(new ServerConnectWindow());
 				
+#ifdef HAVE_LUAJIT
+				Gui::addWindow(new LuaScriptWindow());
+#endif
 			}
 			Gui::log("欢迎使用 Cheat Turbine！");
 			bootstrapped = true;

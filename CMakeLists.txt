@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
+# 项目版本定义
 # ==================== 项目版本定义 ====================
 set(PROJECT_VERSION_MAJOR 1)
 set(PROJECT_VERSION_MINOR 0)
@@ -12,128 +13,60 @@ set(PROTOCOL_VERSION_MINOR 1)
 set(PROTOCOL_VERSION_PATCH 0)
 set(PROTOCOL_VERSION "${PROTOCOL_VERSION_MAJOR}.${PROTOCOL_VERSION_MINOR}.${PROTOCOL_VERSION_PATCH}")
 
-project(ImGuiProject VERSION ${PROJECT_VERSION})
 
+project(ImGuiProject VERSION ${PROJECT_VERSION})
 set(CMAKE_CXX_STANDARD 17)
 
-# 选项：选择渲染后端
+# 渲染后端选项
 option(USE_DX11 "Use DirectX 11 backend" OFF)
 option(USE_DX12 "Use DirectX 12 backend" ON)
-#option(USE_VULKAN "Use Vulkan backend" OFF)
 
-message(STATUS "CMAKE_SOURCE_DIR: ${CMAKE_SOURCE_DIR}")
-
-# ==================== 生成版本信息头文件 ====================
-# 获取当前日期和时间
+# 生成版本信息头文件
 string(TIMESTAMP BUILD_DATE "%Y-%m-%d")
 string(TIMESTAMP BUILD_TIME "%H:%M:%S")
 
-# 尝试获取 Git 信息（可选）
 find_package(Git QUIET)
 if(GIT_FOUND)
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        OUTPUT_VARIABLE GIT_COMMIT_HASH
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+        OUTPUT_VARIABLE GIT_COMMIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        OUTPUT_VARIABLE GIT_BRANCH
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
+        OUTPUT_VARIABLE GIT_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 else()
     set(GIT_COMMIT_HASH "unknown")
     set(GIT_BRANCH "unknown")
 endif()
 
-# 配置版本头文件
-configure_file(
-    ${CMAKE_SOURCE_DIR}/version.h.in
-    ${CMAKE_BINARY_DIR}/generated/version.h
-    @ONLY
-)
-
-# 添加生成的头文件目录到包含路径
-include_directories(${CMAKE_BINARY_DIR}/generated)
-
-message(STATUS "Project Version: ${PROJECT_VERSION}")
-message(STATUS "Protocol Version: ${PROTOCOL_VERSION}")
-message(STATUS "Build Date: ${BUILD_DATE} ${BUILD_TIME}")
-message(STATUS "Git Commit: ${GIT_COMMIT_HASH}")
-message(STATUS "Git Branch: ${GIT_BRANCH}")
+configure_file(${CMAKE_SOURCE_DIR}/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h @ONLY)
 
 
-#设置输出目录
+# 输出目录
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
 
 # 查找 Capstone 库
-set(CAPSTONE_ROOT "C:/Program Files/capstone" CACHE PATH "Capstone installation directory")
-
+set(capstone_ROOT "C:/Program Files/capstone" CACHE PATH "Capstone installation directory")
 find_package(capstone CONFIG QUIET)
+
 if(capstone_FOUND)
-    message(STATUS "Capstone found")
-    # 直接手动查找库文件和头文件，添加搜索路径
-    find_library(CAPSTONE_LIBRARY 
-        NAMES capstone capstone_static
-        HINTS "${CAPSTONE_ROOT}/lib" "${CAPSTONE_ROOT}/build" "${CAPSTONE_ROOT}"
-        PATH_SUFFIXES lib lib64)
-    find_path(CAPSTONE_INCLUDE_DIR 
-        NAMES capstone/capstone.h
-        HINTS "${CAPSTONE_ROOT}/include" "${CAPSTONE_ROOT}"
-        PATH_SUFFIXES include)
-    message(STATUS "Capstone library: ${CAPSTONE_LIBRARY}")
-    message(STATUS "Capstone include: ${CAPSTONE_INCLUDE_DIR}")
-        
-        if(CAPSTONE_LIBRARY AND CAPSTONE_INCLUDE_DIR)
-            set(CAPSTONE_LIBRARIES ${CAPSTONE_LIBRARY})
-            set(CAPSTONE_INCLUDE_DIRS ${CAPSTONE_INCLUDE_DIR})
-            set(HAVE_CAPSTONE TRUE)
-            message(STATUS "Capstone library: ${CAPSTONE_LIBRARY}")
-            message(STATUS "Capstone include: ${CAPSTONE_INCLUDE_DIR}")
-        else()
-            message(WARNING "Capstone package found but files not accessible")
-            set(HAVE_CAPSTONE FALSE)
-        endif()
-    else()
-        # 手动查找 Capstone
-        find_path(CAPSTONE_INCLUDE_DIR capstone/capstone.h)
-        find_library(CAPSTONE_LIBRARY NAMES capstone)
-        if(CAPSTONE_INCLUDE_DIR AND CAPSTONE_LIBRARY)
-            message(STATUS "Capstone found manually")
-            message(STATUS "Capstone include: ${CAPSTONE_INCLUDE_DIR}")
-            message(STATUS "Capstone library: ${CAPSTONE_LIBRARY}")
-            set(CAPSTONE_LIBRARIES ${CAPSTONE_LIBRARY})
-            set(CAPSTONE_INCLUDE_DIRS ${CAPSTONE_INCLUDE_DIR})
-            set(HAVE_CAPSTONE TRUE)
-        else()
-            message(WARNING "Capstone not found! Disassembly features will be disabled.")
-            message(STATUS "To install Capstone, run: vcpkg install capstone:x64-windows")
-            set(HAVE_CAPSTONE FALSE)
-        endif()
-    endif()
+    find_library(CAPSTONE_LIBRARY NAMES capstone capstone_static
+        HINTS "${capstone_ROOT}/lib" "${capstone_ROOT}/build" "${capstone_ROOT}" PATH_SUFFIXES lib lib64)
+    find_path(CAPSTONE_INCLUDE_DIR NAMES capstone/capstone.h
+        HINTS "${capstone_ROOT}/include" "${capstone_ROOT}" PATH_SUFFIXES include)
+else()
+    find_path(CAPSTONE_INCLUDE_DIR capstone/capstone.h)
+    find_library(CAPSTONE_LIBRARY NAMES capstone)
+endif()
 
-
-include_directories(
-    imgui 
-    imgui/backends
-    gui
-    PointerScan
-    )
-
-# 添加 Capstone 包含目录（如果需要）
-if(HAVE_CAPSTONE)
-    if(CAPSTONE_INCLUDE_DIRS)
-        include_directories(${CAPSTONE_INCLUDE_DIRS})
-        message(STATUS "Added Capstone include directory: ${CAPSTONE_INCLUDE_DIRS}")
-    else()
-        message(STATUS "Capstone include directories will be handled by target link")
-    endif()
+if(CAPSTONE_INCLUDE_DIR AND CAPSTONE_LIBRARY)
+    set(HAVE_CAPSTONE TRUE)
+    set(CAPSTONE_LIBRARIES ${CAPSTONE_LIBRARY})
+    set(CAPSTONE_INCLUDE_DIRS ${CAPSTONE_INCLUDE_DIR})
+else()
+    set(HAVE_CAPSTONE FALSE)
+    message(WARNING "Capstone not found! Disassembly features will be disabled.")
 endif()
 
 set(IMGUI_SOURCES
@@ -161,6 +94,33 @@ set(GUI_SOURCES
     gui/ConfigManager.cpp
 )
 
+set(LUA_SOURCES
+    lua/LuaEngine.cpp
+    lua/LuaAPI.cpp
+)
+
+# 查找 LuaJIT 库
+option(LUAJIT_STATIC "Link LuaJIT statically" ON)
+
+set(LUAJIT_DIR "${CMAKE_SOURCE_DIR}/third_party/LuaJIT")
+set(LUAJIT_INCLUDE "${LUAJIT_DIR}/include")
+set(LUAJIT_LIB "${LUAJIT_DIR}/lib")
+set(LUAJIT_BIN "${LUAJIT_DIR}/bin")
+
+if((EXISTS "${LUAJIT_INCLUDE}/lua.hpp" OR EXISTS "${LUAJIT_INCLUDE}/luajit.h" OR EXISTS "${LUAJIT_INCLUDE}/lua.h")
+   AND EXISTS "${LUAJIT_LIB}/lua51.lib")
+    set(HAVE_LUAJIT TRUE)
+    set(LUAJIT_LIBRARY "${LUAJIT_LIB}/lua51.lib")
+    set(LUAJIT_IS_STATIC ${LUAJIT_STATIC})
+else()
+    message(FATAL_ERROR "LuaJIT not found in third_party/LuaJIT directory!")
+    set(HAVE_LUAJIT FALSE)
+endif()
+
+if(HAVE_LUAJIT)
+    list(APPEND GUI_SOURCES gui/LuaScriptWindow.cpp)
+endif()
+
 set(SOCKET_SOURCES
     socket/client_singleton.cpp
 )
@@ -168,19 +128,21 @@ set(SOCKET_SOURCES
 set(POINTERSCAN_SOURCES
     PointerScan/formatter.cpp
     PointerScan/scanner.cpp
- 
 )
 
-if (USE_DX11)
+# 配置 DirectX 后端
+if(USE_DX11)
     add_definitions(-DUSE_DX11)
     list(APPEND IMGUI_SOURCES imgui/backends/imgui_impl_dx11.cpp)
-elseif (USE_DX12)
+    set(DX_LIBS d3d11 dxgi d3dcompiler)
+elseif(USE_DX12)
     add_definitions(-DUSE_DX12)
     list(APPEND IMGUI_SOURCES imgui/backends/imgui_impl_dx12.cpp)
+    set(DX_LIBS d3d12 dxgi d3dcompiler ws2_32)
 endif()
 
-#取消imgui的调试信息
 add_definitions(-DIMGUI_DISABLE_DEBUG_TOOLS)
+
 add_executable(ImGuiProject 
     main.cpp 
     PointerChainExample.cpp
@@ -188,23 +150,44 @@ add_executable(ImGuiProject
     ${GUI_SOURCES} 
     ${SOCKET_SOURCES} 
     ${POINTERSCAN_SOURCES}
+    ${LUA_SOURCES}
 )
 
-# add_executable(TEST
-#     test.cpp
-# )
-# 链接 Windows 系统库
-if (USE_DX11)
-    target_link_libraries(ImGuiProject d3d11 dxgi d3dcompiler)
-elseif (USE_DX12)
-    target_link_libraries(ImGuiProject d3d12 dxgi d3dcompiler ws2_32)
+# 包含目录
+target_include_directories(ImGuiProject PRIVATE
+    imgui imgui/backends gui PointerScan lua
+    ${CMAKE_BINARY_DIR}/generated
+)
+
+if(HAVE_CAPSTONE)
+    target_include_directories(ImGuiProject PRIVATE ${CAPSTONE_INCLUDE_DIRS})
+endif()
+
+if(HAVE_LUAJIT)
+    target_include_directories(ImGuiProject PRIVATE ${LUAJIT_INCLUDE})
+endif()
+
+# 链接系统库
+target_link_libraries(ImGuiProject ${DX_LIBS})
+
+# 链接 LuaJIT 库
+if(HAVE_LUAJIT)
+    get_filename_component(LUAJIT_LIBRARY_ABS ${LUAJIT_LIBRARY} ABSOLUTE)
+    
+    target_link_libraries(ImGuiProject ${LUAJIT_LIBRARY_ABS})
+    target_compile_definitions(ImGuiProject PRIVATE HAVE_LUAJIT)
+    
+    if(LUAJIT_IS_STATIC)
+        target_compile_definitions(ImGuiProject PRIVATE LUAJIT_STATIC)
+    elseif(EXISTS "${LUAJIT_BIN}/lua51.dll")
+        add_custom_command(TARGET ImGuiProject POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LUAJIT_BIN}/lua51.dll" "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/lua51.dll")
+    endif()
 endif()
 
 # 链接 Capstone 库
 if(HAVE_CAPSTONE)
     target_link_libraries(ImGuiProject ${CAPSTONE_LIBRARIES})
     target_compile_definitions(ImGuiProject PRIVATE HAVE_CAPSTONE)
-    message(STATUS "Capstone will be linked to the project: ${CAPSTONE_LIBRARIES}")
-else()
-    message(STATUS "Building without Capstone support")
 endif()

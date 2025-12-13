@@ -1,0 +1,258 @@
+#include "LuaEngine.h"
+#include "LuaAPI.h"
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+#include <iostream>
+
+#ifdef HAVE_LUAJIT
+// LuaJIT使用lua.hpp（已包含所有头文件）
+extern "C" {
+#include "lua.hpp"
+}
+#else
+// 标准Lua需要单独包含
+extern "C" {
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+}
+#endif
+
+LuaEngine& LuaEngine::GetInstance() {
+    static LuaEngine instance;
+    return instance;
+}
+
+bool LuaEngine::Initialize() {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (initialized) {
+        return true;
+    }
+
+    // 创建Lua状态机
+    L = luaL_newstate();
+    if (!L) {
+        lastError = "Failed to create Lua state";
+        return false;
+    }
+
+    // 注册标准库
+    RegisterStandardLibs();
+    
+    // 注册自定义API
+    RegisterAPIs();
+
+    initialized = true;
+    return true;
+}
+
+void LuaEngine::Shutdown() {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (L) {
+        lua_close(L);
+        L = nullptr;
+    }
+    
+    initialized = false;
+    loadedScripts.clear();
+    callbacks.clear();
+    lastError.clear();
+}
+
+LuaEngine::~LuaEngine() {
+    Shutdown();
+}
+
+void LuaEngine::RegisterStandardLibs() {
+    if (!L) return;
+    
+    // 打开标准库（LuaJIT和标准Lua都支持）
+    luaL_openlibs(L);
+}
+
+void LuaEngine::RegisterAPIs() {
+    if (!L) return;
+    
+    // 注册所有自定义API
+    LuaAPI::RegisterAll(L);
+}
+
+bool LuaEngine::ExecuteFile(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!initialized || !L) {
+        lastError = "Lua engine not initialized";
+        return false;
+    }
+
+    // 检查文件是否存在
+    if (!std::filesystem::exists(filepath)) {
+        lastError = "File not found: " + filepath;
+        return false;
+    }
+
+    // 加载并执行文件
+    int result = luaL_loadfile(L, filepath.c_str());
+    if (result != LUA_OK) {
+        lastError = GetLuaError(L);
+        return false;
+    }
+
+    // 执行代码
+    result = lua_pcall(L, 0, LUA_MULTRET, 0);
+    if (result != LUA_OK) {
+        lastError = GetLuaError(L);
+        return false;
+    }
+
+    // 记录已加载的脚本
+    std::string filename = std::filesystem::path(filepath).filename().string();
+    loadedScripts[filename] = filepath;
+
+    return true;
+}
+
+bool LuaEngine::ExecuteString(const std::string& code) {
+    return ExecuteString(code, "=string");
+}
+
+bool LuaEngine::ExecuteString(const std::string& code, const std::string& chunkName) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!initialized || !L) {
+        lastError = "Lua engine not initialized";
+        return false;
+    }
+
+    // 加载代码
+    int result = luaL_loadbuffer(L, code.c_str(), code.length(), chunkName.c_str());
+    if (result != LUA_OK) {
+        lastError = GetLuaError(L);
+        return false;
+    }
+
+    // 执行代码
+    result = lua_pcall(L, 0, LUA_MULTRET, 0);
+    if (result != LUA_OK) {
+        lastError = GetLuaError(L);
+        return false;
+    }
+
+    return true;
+}
+
+bool LuaEngine::ReloadScript(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    auto it = loadedScripts.find(name);
+    if (it == loadedScripts.end()) {
+        lastError = "Script not loaded: " + name;
+        return false;
+    }
+
+    std::string filepath = it->second;
+    return ExecuteFile(filepath);
+}
+
+void LuaEngine::UnloadScript(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mutex);
+    loadedScripts.erase(name);
+}
+
+bool LuaEngine::IsScriptLoaded(const std::string& name) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return loadedScripts.find(name) != loadedScripts.end();
+}
+
+bool LuaEngine::RegisterCallback(const std::string& name, const std::string& luaFunctionName) {
+    std::lock_guard<std::mutex> lock(mutex);
+    callbacks[name] = luaFunctionName;
+    return true;
+}
+
+bool LuaEngine::CallCallback(const std::string& name, int nargs, int nresults) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!initialized || !L) {
+        lastError = "Lua engine not initialized";
+        return false;
+    }
+
+    auto it = callbacks.find(name);
+    if (it == callbacks.end()) {
+        lastError = "Callback not registered: " + name;
+        return false;
+    }
+
+    // 获取Lua函数
+    lua_getglobal(L, it->second.c_str());
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        lastError = "Lua function not found: " + it->second;
+        return false;
+    }
+
+    // 调用函数（参数已经在栈上）
+    int result = lua_pcall(L, nargs, nresults, 0);
+    if (result != LUA_OK) {
+        lastError = GetLuaError(L);
+        return false;
+    }
+
+    return true;
+}
+
+void LuaEngine::AddScriptPath(const std::string& path) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    if (!L) return;
+
+    // 获取当前的package.path
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "path");
+    
+    std::string currentPath = lua_tostring(L, -1);
+    std::string newPath = currentPath + ";" + path + "/?.lua;" + path + "/?/init.lua";
+    
+    lua_pop(L, 1);
+    lua_pushstring(L, newPath.c_str());
+    lua_setfield(L, -2, "path");
+    lua_pop(L, 1);
+}
+
+void LuaEngine::SetScriptBasePath(const std::string& path) {
+    std::lock_guard<std::mutex> lock(mutex);
+    scriptBasePath = path;
+    AddScriptPath(path);
+}
+
+std::vector<std::string> LuaEngine::GetLoadedScripts() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<std::string> result;
+    for (const auto& pair : loadedScripts) {
+        result.push_back(pair.first);
+    }
+    return result;
+}
+
+bool LuaEngine::CheckLuaError(int result) {
+    if (result != LUA_OK) {
+        lastError = GetLuaError(L);
+        return false;
+    }
+    return true;
+}
+
+std::string LuaEngine::GetLuaError(lua_State* L) {
+    const char* error = lua_tostring(L, -1);
+    if (error) {
+        std::string errorStr(error);
+        lua_pop(L, 1);  // 移除错误消息
+        return errorStr;
+    }
+    return "Unknown Lua error";
+}
+
