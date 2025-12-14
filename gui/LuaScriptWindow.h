@@ -20,9 +20,11 @@ private:
     void executeScript(const std::string& filepath);
     void stopScript();
     void reloadScript(const std::string& name);
+    bool openFileDialog(std::string& selectedFile);
 
     // 脚本列表
     std::vector<std::string> scriptFiles;
+    std::vector<std::string> scriptFilePaths;  // 存储完整路径
     std::vector<bool> scriptSelected;
     int selectedScriptIndex = -1;
 
