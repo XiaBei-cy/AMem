@@ -8,8 +8,11 @@
 extern "C" {
 #include "lua.hpp"
 }
-
 #endif
+
+// 前向声明
+struct ImVec2;
+struct ImVec4;
 
 /**
  * Lua API绑定
@@ -21,23 +24,7 @@ public:
     static void RegisterAll(lua_State* L);
 
     // ==================== 内存操作API ====================
-    static int ReadMemory(lua_State* L);
-    static int WriteMemory(lua_State* L);
-    static int ReadMemoryBatch(lua_State* L);
-    static int ReadInt(lua_State* L);
-    static int ReadLong(lua_State* L);
-    static int ReadShort(lua_State* L);
-    static int ReadByte(lua_State* L);
-    static int WriteInt(lua_State* L);
-    static int WriteLong(lua_State* L);
-    static int WriteShort(lua_State* L);
-    static int WriteByte(lua_State* L);
-    static int ReadFloat(lua_State* L);
-    static int ReadDouble(lua_State* L);
-    static int WriteFloat(lua_State* L);
-    static int WriteDouble(lua_State* L);
-    static int ReadString(lua_State* L);
-    static int WriteString(lua_State* L);
+    // 已移至 LuaAPI_Memory.h
 
     // ==================== 进程和模块API ====================
     static int GetProcessList(lua_State* L);
@@ -66,8 +53,11 @@ public:
     static int Sleep(lua_State* L);
     static int GetTime(lua_State* L);
 
-private:
-    // 辅助函数
+    // ==================== ImGui API ====================
+    // 已移至 LuaAPI_ImGui.h
+
+    // ==================== 辅助函数 ====================
+    // 这些函数需要被其他模块（LuaAPI_Memory, LuaAPI_ImGui 等）使用
     static uint64_t CheckAddress(lua_State* L, int index);
     static void PushError(lua_State* L, const std::string& msg);
 };

@@ -97,6 +97,8 @@ set(GUI_SOURCES
 set(LUA_SOURCES
     lua/LuaEngine.cpp
     lua/LuaAPI.cpp
+    lua/LuaAPI_Memory.cpp
+    lua/LuaAPI_ImGui.cpp
 )
 
 # 查找 LuaJIT 库
@@ -118,7 +120,7 @@ else()
 endif()
 
 if(HAVE_LUAJIT)
-    list(APPEND GUI_SOURCES gui/LuaScriptWindow.cpp)
+    list(APPEND GUI_SOURCES gui/LuaScriptWindow.cpp gui/LuaImGuiWindow.cpp)
 endif()
 
 set(SOCKET_SOURCES
