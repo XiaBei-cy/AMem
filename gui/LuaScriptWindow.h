@@ -15,12 +15,15 @@ public:
 private:
     void drawScriptList();
     void drawScriptOutput();
+    void drawScriptContent();
     void drawScriptControls();
     void refreshScriptList();
+    void drawScriptBrowserPopup();
+    void refreshBrowserFiles();
     void executeScript(const std::string& filepath);
     void stopScript();
     void reloadScript(const std::string& name);
-    bool openFileDialog(std::string& selectedFile);
+    void saveCurrentScript();
 
     // 脚本列表
     std::vector<std::string> scriptFiles;
@@ -35,8 +38,16 @@ private:
     // 脚本执行状态
     bool scriptRunning = false;
     std::string currentScript;
+    std::string currentScriptContent;
+    bool currentScriptDirty = false;
 
     // 脚本目录
     std::string scriptDirectory = "./scripts";
+
+    // 使用 ImGui 的脚本浏览弹窗状态
+    bool showScriptBrowser = false;
+    char browserDirectoryBuf[260] = "./scripts";
+    std::vector<std::filesystem::path> browserLuaFiles;
+    int browserSelectedIndex = -1;
 };
 
